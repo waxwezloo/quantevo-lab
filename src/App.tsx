@@ -10,8 +10,8 @@ import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, fmtPct, fmtNum } from
 import { loadKlines, TIMEFRAMES } from "./lib/data";
 import type { Candle } from "./lib/indicators";
 import { ema, rsiWilder } from "./lib/indicators";
-import type { StratCfg, BacktestResult } from "./lib/backtest";
-import { runBacktest, decodeGenome, fmtPrice } from "./lib/backtest";
+import type { StratCfg, BacktestResult, Params } from "./lib/backtest";
+import { runBacktest, decodeGenome, fmtPrice, defaultParams, sanitizeParams } from "./lib/backtest";
 import { DEFAULT_GA, evolve, type GAConfig, type GenInfo, type PopRow } from "./lib/ga";
 
 interface LogLine {
@@ -38,6 +38,10 @@ export default function App() {
     slipPct: 0.03,
     minTrades: 8,
   });
+
+  const [manual, setManual] = useState<Params>(() => defaultParams());
+  const [manualResult, setManualResult] = useState<BacktestResult | null>(null);
+  const [baseline, setBaseline] = useState<BacktestResult | null>(null);
 
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState<{ gen: number; total: number } | null>(null);
@@ -103,6 +107,38 @@ export default function App() {
 
   const times = useMemo(() => candles.map((c) => c.t), [candles]);
 
+  // ---------- базовый бэктест (геном по умолчанию, сразу после загрузки) ----------
+  useEffect(() => {
+    if (candles.length === 0) {
+      setBaseline(null);
+      return;
+    }
+    const t0 = performance.now();
+    const res = runBacktest(candles, tf, defaultParams(), strat);
+    setBaseline(res);
+    setManualResult(null);
+    pushLog(
+      `Базовый бэктест (геном по умолчанию): ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)} · ${Math.round(performance.now() - t0)} мс`
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candles, tf]);
+
+  // ---------- ручной бэктест с фиксированным геномом ----------
+  const runManual = useCallback(() => {
+    if (running || candles.length === 0) return;
+    const res = runBacktest(candles, tf, sanitizeParams(manual), strat);
+    setManualResult(res);
+    setBest(null);
+    setHistory([]);
+    setPopRows([]);
+    setPreviewIdx(-1);
+    setPreviewResult(null);
+    pushLog(
+      `Ручной бэктест: ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)}, Sharpe ${fmtNum(res.metrics.sharpe)}`,
+      res.metrics.returnPct >= 0 ? "ok" : "warn"
+    );
+  }, [running, candles, tf, manual, strat, pushLog]);
+
   // ---------- эволюция ----------
   const runEvolution = useCallback(async () => {
     if (running || candles.length === 0) return;
@@ -166,8 +202,16 @@ export default function App() {
     [previewIdx, popRows, candles, tf, strat, pushLog]
   );
 
-  const shown = previewResult ?? best?.result ?? null;
+  const shown = previewResult ?? best?.result ?? manualResult ?? baseline ?? null;
   const shownFit = previewIdx >= 0 ? popRows[previewIdx]?.fit : best?.row.fit;
+  const shownSource =
+    previewIdx >= 0
+      ? `ОСОБЬ #${previewIdx + 1}`
+      : best
+        ? "GA · ЛУЧШИЙ ГЕНОМ"
+        : manualResult
+          ? "ФИКС. ПАРАМЕТРЫ"
+          : "БАЗОВЫЙ";
   const m = shown?.metrics;
 
   const lastC = candles.length ? candles[candles.length - 1].c : null;
@@ -266,6 +310,9 @@ export default function App() {
                   onGa={(patch) => setGa((g) => ({ ...g, ...patch }))}
                   strat={strat}
                   onStrat={(patch) => setStrat((s) => ({ ...s, ...patch }))}
+                  manual={manual}
+                  onManual={(patch) => setManual((mm) => ({ ...mm, ...patch }) as Params)}
+                  onRunManual={runManual}
                   running={running}
                   progress={progress}
                   onRun={runEvolution}
@@ -334,7 +381,16 @@ export default function App() {
               </div>
 
               <div className="flex flex-col gap-3 lg:col-span-2 xl:col-span-1">
-                <Panel title="Метрики бэктеста" className="reveal" style={{ animationDelay: "120ms" }}>
+                <Panel
+                  title="Метрики бэктеста"
+                  className="reveal"
+                  style={{ animationDelay: "120ms" }}
+                  right={
+                    <span className="qe-num text-[9.5px] tracking-[0.08em] text-teal border border-teal/40 rounded px-1.5 py-0.5 whitespace-nowrap">
+                      {shownSource}
+                    </span>
+                  }
+                >
                   <div className="p-3 grid grid-cols-2 gap-2">
                     <Stat label="Доходность" value={m ? fmtPct(m.returnPct) : "—"} tone={m ? (m.returnPct >= 0 ? "green" : "red") : "mut"} sub={m ? `CAGR ${fmtPct(m.cagr)}` : "нет результата"} />
                     <Stat label="Sharpe" value={m ? fmtNum(m.sharpe) : "—"} tone={m && m.sharpe >= 1 ? "green" : "ink"} sub={m ? `Sortino ${fmtNum(m.sortino)}` : undefined} />

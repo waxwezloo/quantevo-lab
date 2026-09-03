@@ -370,3 +370,29 @@ export function fmtPrice(v: number): string {
   if (v >= 1) return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
   return v.toLocaleString("en-US", { maximumFractionDigits: 5 });
 }
+
+// Параметры «по умолчанию» — середины допустимых диапазонов генов
+// (для лог-генов — геометрическая середина). Используются для
+// базового бэктеста при загрузке и как стартовая точка ручной настройки.
+export function defaultParams(): Params {
+  const g: Genome = GENES.map((d) => {
+    const mid = d.log ? Math.sqrt(d.min * d.max) : (d.min + d.max) / 2;
+    return d.int ? Math.round(mid) : mid;
+  });
+  return decodeGenome(g);
+}
+
+// Приведение параметров к корректным соотношениям (EMA fast < slow, fibLo < fibHi)
+export function sanitizeParams(p: Params): Params {
+  const out: Params = { ...p };
+  if (out.emaFast >= out.emaSlow) {
+    out.emaFast = Math.max(8, Math.min(out.emaFast, out.emaSlow - 12));
+    out.emaSlow = Math.min(260, Math.max(out.emaSlow, out.emaFast + 12));
+  }
+  if (out.fibLo >= out.fibHi) {
+    const mid = (out.fibLo + out.fibHi) / 2;
+    out.fibLo = Math.max(0.2, mid - 0.06);
+    out.fibHi = Math.min(0.85, mid + 0.06);
+  }
+  return out;
+}

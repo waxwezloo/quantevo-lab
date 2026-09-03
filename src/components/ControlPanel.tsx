@@ -1,5 +1,6 @@
 import type { GAConfig } from "../lib/ga";
-import type { StratCfg } from "../lib/backtest";
+import type { StratCfg, Params, GeneDef } from "../lib/backtest";
+import { GENES } from "../lib/backtest";
 import { PAIRS, TIMEFRAMES, type DataSource } from "../lib/data";
 import { Panel, SliderField, Toggle, Seg, Led, IconPlay, IconStop, IconDice } from "./ui";
 
@@ -20,10 +21,48 @@ interface Props {
   onGa: (patch: Partial<GAConfig>) => void;
   strat: StratCfg;
   onStrat: (patch: Partial<StratCfg>) => void;
+  manual: Params;
+  onManual: (patch: Partial<Params>) => void;
+  onRunManual: () => void;
   running: boolean;
   progress: { gen: number; total: number } | null;
   onRun: () => void;
   onStop: () => void;
+}
+
+// Лог-слайдер для генов с логарифмической шкалой (Калман Q)
+function LogSlider({
+  def,
+  value,
+  disabled,
+  onChange,
+}: {
+  def: GeneDef;
+  value: number;
+  disabled?: boolean;
+  onChange: (v: number) => void;
+}) {
+  const ratio = def.max / def.min;
+  const u = Math.log(Math.max(value, def.min) / def.min) / Math.log(ratio);
+  const ui = Math.round(Math.min(1, Math.max(0, u)) * 1000);
+  return (
+    <label className="block col-span-2">
+      <div className="flex items-baseline justify-between mb-1.5">
+        <span className="text-[12px] text-mut">{def.label}</span>
+        <span className="qe-num text-[12px] font-semibold text-teal">{value.toExponential(1)}</span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={1000}
+        step={5}
+        value={ui}
+        disabled={disabled}
+        style={{ ["--fill" as string]: `${(ui / 1000) * 100}%` }}
+        onChange={(e) => onChange(def.min * Math.pow(ratio, Number(e.target.value) / 1000))}
+      />
+    </label>
+  );
 }
 
 export default function ControlPanel(p: Props) {
@@ -177,6 +216,52 @@ export default function ControlPanel(p: Props) {
                 onChange={(e) => p.onStrat({ minTrades: Math.max(1, Number(e.target.value) || 1) })} />
             </label>
           </div>
+        </div>
+      </Panel>
+
+      {/* ---- ФИКСИРОВАННЫЙ ГЕНОМ ---- */}
+      <Panel title="Фиксированный геном · ручной бэктест" tick="teal">
+        <div className="p-3.5 flex flex-col gap-3">
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3">
+            {GENES.map((d) =>
+              d.log ? (
+                <LogSlider
+                  key={d.key}
+                  def={d}
+                  value={p.manual[d.key]}
+                  disabled={p.running}
+                  onChange={(v) => p.onManual({ [d.key]: v })}
+                />
+              ) : (
+                <SliderField
+                  key={d.key}
+                  label={d.label}
+                  value={p.manual[d.key]}
+                  min={d.min}
+                  max={d.max}
+                  step={d.int ? 1 : 0.01}
+                  disabled={p.running}
+                  fmt={(v) => (d.int ? String(Math.round(v)) : v.toFixed(2))}
+                  onChange={(v) => p.onManual({ [d.key]: v })}
+                />
+              )
+            )}
+          </div>
+          <button
+            type="button"
+            className="w-full py-2.5 rounded-lg border border-teal/50 text-teal text-[12px] qe-num font-bold tracking-wide flex items-center justify-center gap-2 transition-all duration-150 hover:bg-teal/10 hover:border-teal hover:-translate-y-px disabled:opacity-45 disabled:cursor-not-allowed"
+            onClick={p.onRunManual}
+            disabled={p.running || p.data.loading || p.data.count === 0}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2.5 12.5 6 8l2.5 2.5L13.5 4" />
+              <path d="M10 4h3.5v3.5" />
+            </svg>
+            БЭКТЕСТ С ЭТИМИ ПАРАМЕТРАМИ
+          </button>
+          <p className="text-[10px] leading-relaxed text-dim">
+            Мгновенный прогон без эволюции — удобно проверять гипотезы. GA ищет optimum по всем 15 генам одновременно.
+          </p>
         </div>
       </Panel>
 

@@ -65,10 +65,13 @@ export function decodeGenome(g: Genome): Params {
 }
 
 export interface StratCfg {
+  mode: "spot" | "linear"; // spot | USDT-перпетуал
+  leverage: number; // плечо (только linear)
   allowShort: boolean;
   trendFilter: boolean;
-  feePct: number;
+  feePct: number; // % за сторону
   slipPct: number;
+  fundingPct: number; // % за 8ч (linear)
   minTrades: number;
 }
 
@@ -92,6 +95,8 @@ export interface Metrics {
   pf: number;
   trades: number;
   avgPct: number;
+  avgWinPct: number;
+  avgLossPct: number;
   exposure: number;
 }
 
@@ -143,6 +148,12 @@ export function runBacktest(
 
   const fee = cfg.feePct / 100;
   const slip = cfg.slipPct / 100;
+  const lev = cfg.mode === "linear" ? Math.min(100, Math.max(1, cfg.leverage)) : 1;
+  // фандинг perp: доля % за 8ч, начисляется за время удержания
+  const fundingPerBar =
+    cfg.mode === "linear" ? (cfg.fundingPct / 100) * (tfMinutes / 480) * lev : 0;
+  // модель ликвидации: убыток ~90% маржи закрывает позицию
+  const liqMove = lev > 1 ? 0.9 / lev : Infinity;
 
   const longCond = (t: number): boolean => {
     const lo = longZ.lo[t];
@@ -175,6 +186,8 @@ export function runBacktest(
   let sl = 0;
   let pendingDir: 0 | 1 | -1 = 0;
   let barsInPos = 0;
+  let barsHeld = 0;
+  let worst = 0;
 
   for (let t = warm; t < n; t++) {
     const c = close[t];
@@ -187,13 +200,21 @@ export function runBacktest(
       pendingDir = 0;
       tp = pos === 1 ? o * (1 + p.tpPct / 100) : o * (1 - p.tpPct / 100);
       sl = pos === 1 ? o * (1 - p.slPct / 100) : o * (1 + p.slPct / 100);
+      barsHeld = 0;
+      worst = 0;
     }
 
     if (pos !== 0) {
       barsInPos++;
+      barsHeld++;
+      const adv = pos === 1 ? (entryP - low[t]) / entryP : (high[t] - entryP) / entryP;
+      if (adv > worst) worst = adv;
       let exitP = 0;
       let reason = "";
-      if (pos === 1) {
+      if (worst >= liqMove) {
+        exitP = pos === 1 ? entryP * (1 - liqMove) : entryP * (1 + liqMove);
+        reason = "LIQ";
+      } else if (pos === 1) {
         if (low[t] <= sl) {
           exitP = sl;
           reason = "SL";
@@ -224,8 +245,14 @@ export function runBacktest(
         }
       }
       if (exitP > 0) {
-        const gross = pos * (exitP - entryP) / entryP;
-        const net = gross - 2 * fee;
+        const gross = (pos * (exitP - entryP)) / entryP;
+        let net: number;
+        if (reason === "LIQ") {
+          net = -0.9; // ликвидация: потеря ~90% маржи позиции
+        } else {
+          net = lev * gross - 2 * fee * lev - fundingPerBar * barsHeld;
+          net = Math.max(net, -0.98);
+        }
         eq *= 1 + net;
         trades.push({
           dir: pos,
@@ -248,13 +275,13 @@ export function runBacktest(
     equity[t] =
       pos === 0
         ? eq
-        : eq * (1 + pos * ((c - entryP) / entryP) - fee);
+        : eq * (1 + Math.max(lev * pos * ((c - entryP) / entryP), -0.9) - fee * lev);
   }
 
   if (pos !== 0) {
     const exitP = close[n - 1];
-    const gross = pos * (exitP - entryP) / entryP;
-    const net = gross - 2 * fee;
+    const gross = (pos * (exitP - entryP)) / entryP;
+    const net = Math.max(lev * gross - 2 * fee * lev - fundingPerBar * barsHeld, -0.98);
     eq *= 1 + net;
     trades.push({
       dir: pos,
@@ -338,6 +365,8 @@ export function computeMetrics(
     pf: grossL > 0 ? grossW / grossL : grossW > 0 ? 99 : 0,
     trades: nt,
     avgPct: nt ? sumPct / nt : 0,
+    avgWinPct: wins ? grossW / wins : 0,
+    avgLossPct: nt - wins > 0 ? grossL / (nt - wins) : 0,
     exposure: n ? barsInPos / n : 0,
   };
 }

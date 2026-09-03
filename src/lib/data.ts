@@ -1,39 +1,56 @@
 // ============================================================
-// QuantEvo Lab — данные: Bybit V5 public API (kline, пагинация)
-// с детерминированным синтетическим фолбэком (режимы + кластеризация волатильности)
+// QuantEvo Lab — данные: Bybit V5 public API (kline, пагинация),
+// спот и USDT-перпетуал, все таймфреймы Bybit (1м — 1Н),
+// детерминированный синтетический фолбэк
 // ============================================================
 
 import type { Candle } from "./indicators";
 
+export type MarketMode = "spot" | "linear";
+
 export const PAIRS = [
-  "BTCUSDT",
-  "ETHUSDT",
-  "SOLUSDT",
-  "BNBUSDT",
-  "XRPUSDT",
-  "DOGEUSDT",
-  "TONUSDT",
-  "LINKUSDT",
-  "AVAXUSDT",
-  "ARBUSDT",
+  "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+  "DOGEUSDT", "TONUSDT", "LINKUSDT", "AVAXUSDT", "ARBUSDT",
+  "OPUSDT", "ADAUSDT", "LTCUSDT", "BCHUSDT", "DOTUSDT",
+  "NEARUSDT", "APTUSDT", "SUIUSDT", "SEIUSDT", "INJUSDT",
+  "TIAUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+  "SHIBUSDT", "UNIUSDT", "AAVEUSDT", "FILUSDT", "ATOMUSDT",
+  "ETCUSDT", "XLMUSDT", "TRXUSDT", "POLUSDT", "RENDERUSDT",
+  "TAOUSDT", "ORDIUSDT", "JUPUSDT", "WLDUSDT", "ENAUSDT",
 ];
 
 export const TIMEFRAMES = [
+  { min: 1, label: "1М", interval: "1" },
+  { min: 3, label: "3М", interval: "3" },
+  { min: 5, label: "5М", interval: "5" },
+  { min: 15, label: "15М", interval: "15" },
+  { min: 30, label: "30М", interval: "30" },
   { min: 60, label: "1Ч", interval: "60" },
+  { min: 120, label: "2Ч", interval: "120" },
   { min: 240, label: "4Ч", interval: "240" },
+  { min: 360, label: "6Ч", interval: "360" },
+  { min: 720, label: "12Ч", interval: "720" },
+  { min: 1440, label: "1Д", interval: "D" },
+  { min: 10080, label: "1Н", interval: "W" },
 ];
 
+// Максимум свечей в серии: на минутных ТФ глубина автоматически
+// урезается, чтобы бэктест оставался быстрым и наглядным.
+export const MAX_BARS = 26000;
+
+export function daysForTf(intervalMin: number): number {
+  return Math.max(3, Math.min(365, Math.floor((MAX_BARS * intervalMin) / 1440)));
+}
+
 export const BASE_PRICE: Record<string, number> = {
-  BTCUSDT: 97400,
-  ETHUSDT: 3480,
-  SOLUSDT: 216,
-  BNBUSDT: 642,
-  XRPUSDT: 2.31,
-  DOGEUSDT: 0.327,
-  TONUSDT: 5.42,
-  LINKUSDT: 21.6,
-  AVAXUSDT: 38.4,
-  ARBUSDT: 0.92,
+  BTCUSDT: 97400, ETHUSDT: 3480, SOLUSDT: 216, BNBUSDT: 642, XRPUSDT: 2.31,
+  DOGEUSDT: 0.327, TONUSDT: 5.42, LINKUSDT: 21.6, AVAXUSDT: 38.4, ARBUSDT: 0.92,
+  OPUSDT: 1.85, ADAUSDT: 0.98, LTCUSDT: 104, BCHUSDT: 470, DOTUSDT: 7.2,
+  NEARUSDT: 5.4, APTUSDT: 9.1, SUIUSDT: 4.3, SEIUSDT: 0.42, INJUSDT: 22.5,
+  TIAUSDT: 10.8, PEPEUSDT: 0.000018, WIFUSDT: 1.9, BONKUSDT: 0.000028, FLOKIUSDT: 0.00016,
+  SHIBUSDT: 0.000022, UNIUSDT: 12.8, AAVEUSDT: 265, FILUSDT: 5.4, ATOMUSDT: 6.8,
+  ETCUSDT: 26.5, XLMUSDT: 0.42, TRXUSDT: 0.24, POLUSDT: 0.45, RENDERUSDT: 7.2,
+  TAOUSDT: 430, ORDIUSDT: 35, JUPUSDT: 0.9, WLDUSDT: 2.1, ENAUSDT: 0.85,
 };
 
 const API = "https://api.bybit.com/v5/market/kline";
@@ -43,11 +60,12 @@ export type DataSource = "bybit" | "synthetic";
 export async function loadKlines(
   symbol: string,
   intervalMin: number,
-  days: number
+  days: number,
+  mode: MarketMode = "spot"
 ): Promise<{ candles: Candle[]; source: DataSource }> {
   try {
-    const candles = await fetchBybit(symbol, intervalMin, days);
-    if (candles.length > 400) return { candles, source: "bybit" };
+    const candles = await fetchBybit(symbol, intervalMin, days, mode);
+    if (candles.length > 40) return { candles, source: "bybit" };
     throw new Error("insufficient data");
   } catch {
     return { candles: syntheticCandles(symbol, intervalMin, days), source: "synthetic" };
@@ -57,8 +75,11 @@ export async function loadKlines(
 async function fetchBybit(
   symbol: string,
   intervalMin: number,
-  days: number
+  days: number,
+  mode: MarketMode
 ): Promise<Candle[]> {
+  const tf = TIMEFRAMES.find((t) => t.min === intervalMin);
+  const interval = tf?.interval ?? String(intervalMin);
   const end = Date.now();
   const start = end - days * 86400000;
   const all: Candle[] = [];
@@ -69,7 +90,7 @@ async function fetchBybit(
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 8000);
     const url =
-      `${API}?category=spot&symbol=${symbol}&interval=${intervalMin}` +
+      `${API}?category=${mode}&symbol=${symbol}&interval=${interval}` +
       `&start=${start}&end=${cursor}&limit=1000`;
     const res = await fetch(url, { signal: ctrl.signal });
     clearTimeout(timer);
@@ -81,17 +102,12 @@ async function fetchBybit(
     if (json.retCode !== 0 || !json.result?.list) throw new Error("bad response");
     const list = json.result.list;
     if (list.length === 0) break;
+    let minT = Infinity;
     for (const k of list) {
-      all.push({
-        t: Number(k[0]),
-        o: Number(k[1]),
-        h: Number(k[2]),
-        l: Number(k[3]),
-        c: Number(k[4]),
-        v: Number(k[5]),
-      });
+      const t = Number(k[0]);
+      if (t < minT) minT = t;
+      all.push({ t, o: Number(k[1]), h: Number(k[2]), l: Number(k[3]), c: Number(k[4]), v: Number(k[5]) });
     }
-    const minT = Math.min(...list.map((k) => Number(k[0])));
     if (list.length < 1000 || minT <= start) break;
     cursor = minT - 1;
     await new Promise((r) => setTimeout(r, 130));

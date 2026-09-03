@@ -13,7 +13,7 @@ QuantEvo · ga_bybit_trader.py
 Генетический алгоритм подбора параметров торговой стратегии
 для биржи Bybit (публичные данные V5, spot).
 
-Стратегия FibDiv (основные таймфреймы 1Ч / 4Ч):
+Стратегия FibDiv (таймфреймы Bybit 1м–1Н, основные 1Ч / 4Ч):
   * Метод Такенса: delay-embedding ln(close) с лагом tau и
     размерностью m, проекция на первую главную компоненту.
   * Расширенный фильтр Калмана (состояние [уровень, скорость],
@@ -25,6 +25,11 @@ QuantEvo · ga_bybit_trader.py
   * Трендовый фильтр EMA fast/slow, RSI (Wilder).
   * Вход на открытии следующего бара, TP/SL внутри бара,
     комиссия taker + проскальзывание, реверс-выход.
+  * Спот или USDT-перпетуал (category), кредитное плечо,
+    фандинг за 8ч, модель ликвидации (~90% маржи).
+  * Риск/награда: сетап TP/SL и реализованный (ср. прибыль /
+    ср. убыток) — в отчёте и в JSON. Геном можно экспортировать
+    из веб-лаборатории и прогнать через --import-params.
 
 Генетический алгоритм: турнирный отбор, BLX-кроссовер,
 гауссова мутация в нормированном пространстве, элитизм.
@@ -36,6 +41,12 @@ QuantEvo · ga_bybit_trader.py
 Запуск (бэктест за последний год, таймфрейм 1Ч):
     python ga_bybit_trader.py --symbol ETHUSDT --interval 60
     python ga_bybit_trader.py --symbol BTCUSDT --interval 240 --pop 64 --gens 40
+
+Перпетуал с плечом ×5 (USDT Perpetual, комиссия 0.055%):
+    python ga_bybit_trader.py --symbol ETHUSDT --interval 240 --category linear --leverage 5
+
+Бэктест генома из веб-лаборатории (без эволюции):
+    python ga_bybit_trader.py --symbol ETHUSDT --interval 60 --import-params quantevo_genome.json
 
 Live-режим (ОПАСНО, только для тестирования на малых объёмах):
     python ga_bybit_trader.py --symbol ETHUSDT --interval 60 --live \\
@@ -67,8 +78,11 @@ class BybitClient:
         self.api_secret = api_secret
         self.sess = requests.Session()
 
-    def fetch_klines(self, symbol, interval, days=365):
+    def fetch_klines(self, symbol, interval, days=365, category="spot"):
         """Свечи с пагинацией (лимит V5 = 1000). Возвращает dict of np.array."""
+        iv = {1440: "D", 10080: "W"}.get(interval, str(interval))
+        # на минутках глубина урезается до ~26k свечей
+        days = max(3, min(days, (26000 * interval) // 1440))
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - days * 86400000
         raw = []
@@ -77,9 +91,9 @@ class BybitClient:
             resp = self.sess.get(
                 BASE_URL + "/v5/market/kline",
                 params={
-                    "category": "spot",
+                    "category": category,
                     "symbol": symbol,
-                    "interval": str(interval),
+                    "interval": iv,
                     "start": start_ms,
                     "end": cursor,
                     "limit": 1000,
@@ -351,8 +365,11 @@ def build_signals(c, p, allow_short, trend_filter):
 
 
 def run_backtest(c, p, allow_short=True, trend_filter=True,
-                 fee_pct=0.055, slip_pct=0.03):
-    """Бэктест: вход по open следующего бара, TP/SL внутри бара."""
+                 fee_pct=0.055, slip_pct=0.03, leverage=1.0,
+                 funding_pct=0.01, tf_minutes=60):
+    """Бэктест: вход по open следующего бара, TP/SL внутри бара.
+    leverage > 1 — режим перпетуала: PnL и комиссии масштабируются,
+    начисляется фандинг, при убытке ~90% маржи — ликвидация."""
     o, h, l, cl = c["o"], c["h"], c["l"], c["c"]
     n = len(cl)
     long_sig, short_sig, rsi, _, _, _ = build_signals(
@@ -362,12 +379,16 @@ def run_backtest(c, p, allow_short=True, trend_filter=True,
                int(round(p["swing_len"])) * 2 + 5)
     fee = fee_pct / 100.0
     slip = slip_pct / 100.0
+    lev = max(1.0, float(leverage))
+    funding_bar = (funding_pct / 100.0) * (tf_minutes / 480.0) * lev
+    liq_move = 0.9 / lev if lev > 1 else float("inf")
 
     equity = np.full(n, 10000.0)
     trades = []
     eq = 10000.0
     pos, entry_p, entry_i, tp, sl = 0, 0.0, 0, 0.0, 0.0
     pending = 0
+    bars_held, worst = 0, 0.0
 
     for t in range(warm, n):
         if pending != 0:
@@ -377,9 +398,18 @@ def run_backtest(c, p, allow_short=True, trend_filter=True,
                 tp, sl = op * (1 + p["tp_pct"] / 100), op * (1 - p["sl_pct"] / 100)
             else:
                 tp, sl = op * (1 - p["tp_pct"] / 100), op * (1 + p["sl_pct"] / 100)
+            bars_held, worst = 0, 0.0
         if pos != 0:
+            bars_held += 1
+            adv = ((entry_p - l[t]) / entry_p if pos == 1
+                   else (h[t] - entry_p) / entry_p)
+            if adv > worst:
+                worst = adv
             exit_p, reason = 0.0, ""
-            if pos == 1:
+            if worst >= liq_move:
+                exit_p = entry_p * (1 - liq_move if pos == 1 else 1 + liq_move)
+                reason = "LIQ"
+            elif pos == 1:
                 if l[t] <= sl:
                     exit_p, reason = sl, "SL"
                 elif h[t] >= tp:
@@ -398,7 +428,12 @@ def run_backtest(c, p, allow_short=True, trend_filter=True,
                 elif pos == -1 and rsi[t] < p["rsi_low"] - 6:
                     exit_p, reason = cl[t], "RSI"
             if exit_p > 0:
-                net = pos * (exit_p - entry_p) / entry_p - 2 * fee
+                gross = pos * (exit_p - entry_p) / entry_p
+                if reason == "LIQ":
+                    net = -0.9  # потеря ~90% маржи
+                else:
+                    net = max(lev * gross - 2 * fee * lev
+                              - funding_bar * bars_held, -0.98)
                 eq *= 1 + net
                 trades.append({"dir": pos, "entry_i": entry_i, "exit_i": t,
                                "entry_p": entry_p, "exit_p": exit_p,
@@ -412,10 +447,12 @@ def run_backtest(c, p, allow_short=True, trend_filter=True,
         if pos == 0:
             equity[t] = eq
         else:
-            equity[t] = eq * (1 + pos * (cl[t] - entry_p) / entry_p - fee)
+            equity[t] = eq * (1 + max(lev * pos * (cl[t] - entry_p) / entry_p,
+                                      -0.9) - fee * lev)
 
     if pos != 0:
-        net = pos * (cl[-1] - entry_p) / entry_p - 2 * fee
+        net = max(lev * (pos * (cl[-1] - entry_p) / entry_p) - 2 * fee * lev
+                  - funding_bar * bars_held, -0.98)
         eq *= 1 + net
         trades.append({"dir": pos, "entry_i": entry_i, "exit_i": n - 1,
                        "entry_p": entry_p, "exit_p": cl[-1],
@@ -448,6 +485,8 @@ def compute_metrics(equity, trades, tf_minutes):
         "win_rate": 100.0 * len(wins) / len(trades) if trades else 0.0,
         "profit_factor": pf, "trades": len(trades),
         "avg_pct": float(np.mean([t["pnl_pct"] for t in trades])) if trades else 0.0,
+        "avg_win_pct": gw / len(wins) if wins else 0.0,
+        "avg_loss_pct": gl / len(losses) if losses else 0.0,
     }
 
 
@@ -528,7 +567,8 @@ class GAConfig:
 
 
 def evolve(candles, tf_minutes, ga, allow_short=True, trend_filter=True,
-           fee_pct=0.055, slip_pct=0.03, min_trades=8, verbose=True):
+           fee_pct=0.055, slip_pct=0.03, leverage=1.0, funding_pct=0.01,
+           min_trades=8, verbose=True):
     rng = np.random.default_rng(ga.seed)
     n_genes = len(GENE_DEFS)
     pop = np.array([[gene_from_u(rng.random(), d) for d in GENE_DEFS]
@@ -543,7 +583,8 @@ def evolve(candles, tf_minutes, ga, allow_short=True, trend_filter=True,
         return fitness_fn(m, ga.weights, min_trades), m
 
     def _bt(c, p, tf, ash, tfil, fee, slip):
-        return run_backtest(c, p, ash, tfil, fee, slip)
+        return run_backtest(c, p, ash, tfil, fee, slip,
+                            leverage, funding_pct, tf_minutes)
 
     for gen in range(ga.gens):
         scored = []
@@ -585,7 +626,8 @@ def evolve(candles, tf_minutes, ga, allow_short=True, trend_filter=True,
 
     g_best, m_best = best_ever
     equity, trades = run_backtest(candles, decode(list(g_best)), allow_short,
-                                  trend_filter, fee_pct, slip_pct)
+                                  trend_filter, fee_pct, slip_pct,
+                                  leverage, funding_pct, tf_minutes)
     return {"genome": {d[0]: g_best[i] for i, d in enumerate(GENE_DEFS)},
             "params": decode(list(g_best)), "metrics": m_best,
             "history": history, "trades": trades}
@@ -602,8 +644,17 @@ def _tournament(scored, k, rng):
 def main():
     ap = argparse.ArgumentParser(description="QuantEvo GA-трейдер Bybit")
     ap.add_argument("--symbol", default="ETHUSDT", help="Торговая пара, например BTCUSDT")
-    ap.add_argument("--interval", type=int, default=60, choices=[60, 240],
-                    help="Таймфрейм в минутах: 60 (1Ч) или 240 (4Ч)")
+    ap.add_argument("--interval", type=int, default=60,
+                    choices=[1, 3, 5, 15, 30, 60, 120, 240, 360, 720, 1440, 10080],
+                    help="Минуты: 1..720, 1440=1Д, 10080=1Н (основные 60/240)")
+    ap.add_argument("--category", default="spot", choices=["spot", "linear"],
+                    help="spot или USDT-перпетуал (плечо)")
+    ap.add_argument("--leverage", type=float, default=1.0,
+                    help="Кредитное плечо (только --category linear)")
+    ap.add_argument("--funding", type=float, default=0.01,
+                    help="Фандинг %% за 8 часов (linear)")
+    ap.add_argument("--import-params", default="",
+                    help="JSON с геномом (экспорт веб-лаборатории): бэктест без GA")
     ap.add_argument("--days", type=int, default=365, help="Глубина истории")
     ap.add_argument("--pop", type=int, default=48, help="Размер популяции")
     ap.add_argument("--gens", type=int, default=30, help="Число поколений")
@@ -619,16 +670,45 @@ def main():
     args = ap.parse_args()
 
     client = BybitClient(args.api_key, args.api_secret)
-    print("Загрузка {} {} за {} дней с Bybit...".format(
-        args.symbol, args.interval, args.days))
-    candles = client.fetch_klines(args.symbol, args.interval, args.days)
+    lev = max(1.0, args.leverage) if args.category == "linear" else 1.0
+    print("Загрузка {} {} ({}) с Bybit...".format(
+        args.symbol, args.interval, args.category))
+    candles = client.fetch_klines(args.symbol, args.interval, args.days,
+                                  args.category)
     print("Свечей: {}".format(len(candles["c"])))
 
-    ga = GAConfig(pop=args.pop, gens=args.gens, mut_rate=args.mut, seed=args.seed)
-    result = evolve(candles, args.interval, ga,
-                    allow_short=args.allow_short,
-                    trend_filter=not args.no_trend_filter,
-                    fee_pct=args.fee)
+    def _cam(sn):  # snake_case -> camelCase (ключи веб-лаборатории)
+        a = sn.split("_")
+        return a[0] + "".join(w.title() for w in a[1:])
+
+    if args.import_params:
+        with open(args.import_params, "r", encoding="utf-8") as f:
+            imp = json.load(f)
+        src = imp.get("genome") or imp.get("params")
+        if not isinstance(src, dict):
+            raise SystemExit("В JSON нет поля genome/params")
+        p_in = {}
+        for key, lo, hi, is_int, _ in GENE_DEFS:
+            v = float(src.get(key, src.get(_cam(key), float("nan"))))
+            if not math.isfinite(v):
+                raise SystemExit("В геноме нет ключа " + key)
+            v = min(hi, max(lo, v))
+            p_in[key] = int(round(v)) if is_int else v
+        equity, trades = run_backtest(candles, p_in, args.allow_short,
+                                      not args.no_trend_filter, args.fee,
+                                      0.03, lev, args.funding, args.interval)
+        m = compute_metrics(equity, trades, args.interval)
+        result = {"genome": p_in, "params": p_in, "metrics": m,
+                  "history": [], "trades": trades}
+        print("Импортирован геном из " + args.import_params)
+    else:
+        ga = GAConfig(pop=args.pop, gens=args.gens, mut_rate=args.mut,
+                      seed=args.seed)
+        result = evolve(candles, args.interval, ga,
+                        allow_short=args.allow_short,
+                        trend_filter=not args.no_trend_filter,
+                        fee_pct=args.fee, leverage=lev,
+                        funding_pct=args.funding)
 
     m = result["metrics"]
     print("")
@@ -644,9 +724,16 @@ def main():
     print("  Win rate        {:.1f}%".format(m["win_rate"]))
     print("  Profit factor   {:.2f}".format(m["profit_factor"]))
     print("  Сделок          {}".format(m["trades"]))
+    rr_set = result["params"]["tp_pct"] / max(result["params"]["sl_pct"], 1e-9)
+    rr_real = (m["avg_win_pct"] / m["avg_loss_pct"]
+               if m["avg_loss_pct"] > 0 else float("inf"))
+    print("  R/R сетап (TP/SL)   1 : {:.2f}".format(rr_set))
+    print("  R/R реализованный   1 : {:.2f}".format(rr_real))
 
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"symbol": args.symbol, "interval": args.interval,
+        json.dump({"app": "QuantEvo Lab", "symbol": args.symbol,
+                   "interval": args.interval, "category": args.category,
+                   "leverage": lev,
                    "genome": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
                               for k, v in result["genome"].items()},
                    "metrics": m}, f, indent=2, ensure_ascii=False)

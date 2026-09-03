@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import TickerTape from "./components/TickerTape";
 import ControlPanel, { type DataState } from "./components/ControlPanel";
 import PriceChart from "./components/PriceChart";
@@ -6,12 +6,12 @@ import EquityChart from "./components/EquityChart";
 import FitnessChart from "./components/FitnessChart";
 import PopulationTable from "./components/PopulationTable";
 import CodePanel from "./components/CodePanel";
-import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, fmtPct, fmtNum } from "./components/ui";
-import { loadKlines, TIMEFRAMES } from "./lib/data";
+import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, IconDownload, fmtPct, fmtNum } from "./components/ui";
+import { loadKlines, TIMEFRAMES, daysForTf } from "./lib/data";
 import type { Candle } from "./lib/indicators";
 import { ema, rsiWilder } from "./lib/indicators";
 import type { StratCfg, BacktestResult, Params } from "./lib/backtest";
-import { runBacktest, decodeGenome, fmtPrice, defaultParams, sanitizeParams } from "./lib/backtest";
+import { runBacktest, decodeGenome, fmtPrice, defaultParams, sanitizeParams, GENES } from "./lib/backtest";
 import { DEFAULT_GA, evolve, type GAConfig, type GenInfo, type PopRow } from "./lib/ga";
 
 interface LogLine {
@@ -23,6 +23,34 @@ interface LogLine {
 
 let logId = 0;
 
+// Перехват ошибок рендера: вместо белого экрана — диагностическая панель
+class ErrorBoundary extends Component<{ children: ReactNode }, { err: Error | null }> {
+  state: { err: Error | null } = { err: null };
+  static getDerivedStateFromError(err: Error) {
+    return { err };
+  }
+  componentDidCatch(err: Error) {
+    console.error("QuantEvo render error:", err);
+  }
+  render() {
+    if (this.state.err) {
+      return (
+        <div className="min-h-screen flex items-center justify-center p-6">
+          <div className="qe-panel max-w-lg w-full p-6 text-center reveal">
+            <div className="qe-num text-[11px] tracking-[0.24em] text-red mb-2">СБОЙ РЕНДЕРА</div>
+            <h2 className="font-disp text-[15px] font-bold mb-2">Терминал перехватил исключение</h2>
+            <p className="qe-num text-[11px] text-mut leading-relaxed mb-5 break-all">{this.state.err.message}</p>
+            <button type="button" className="btn-run px-5 py-2.5 text-[12px] tracking-wide" onClick={() => window.location.reload()}>
+              ПЕРЕЗАГРУЗИТЬ ЛАБОРАТОРИЮ
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [tab, setTab] = useState<"lab" | "code">("lab");
   const [pair, setPair] = useState("BTCUSDT");
@@ -32,10 +60,13 @@ export default function App() {
 
   const [ga, setGa] = useState<GAConfig>(DEFAULT_GA);
   const [strat, setStrat] = useState<StratCfg>({
+    mode: "spot",
+    leverage: 3,
     allowShort: true,
     trendFilter: true,
-    feePct: 0.055,
+    feePct: 0.1,
     slipPct: 0.03,
+    fundingPct: 0.01,
     minTrades: 8,
   });
 
@@ -68,6 +99,7 @@ export default function App() {
   }, [log]);
 
   const tfLabel = TIMEFRAMES.find((t) => t.min === tf)?.label ?? "1Ч";
+  const days = daysForTf(tf);
 
   // ---------- загрузка данных ----------
   useEffect(() => {
@@ -78,8 +110,12 @@ export default function App() {
     setPopRows([]);
     setPreviewIdx(-1);
     setPreviewResult(null);
-    pushLog(`Загрузка ${pair} · ${tfLabel} · 365 дней…`);
-    loadKlines(pair, tf, 365).then(({ candles: cs, source }) => {
+    setBaseline(null);
+    setManualResult(null);
+    pushLog(
+      `Загрузка ${pair} · ${tfLabel} · ${days} дней (${strat.mode === "linear" ? "USDT Perpetual" : "spot"})…`
+    );
+    loadKlines(pair, tf, days, strat.mode).then(({ candles: cs, source }) => {
       if (cancelled) return;
       setCandles(cs);
       setDataState({ loading: false, source, count: cs.length });
@@ -90,7 +126,7 @@ export default function App() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pair, tf, reloadKey]);
+  }, [pair, tf, reloadKey, strat.mode]);
 
   // ---------- индикаторы для отображения ----------
   const view = useMemo(() => {
@@ -107,7 +143,8 @@ export default function App() {
 
   const times = useMemo(() => candles.map((c) => c.t), [candles]);
 
-  // ---------- базовый бэктест (геном по умолчанию, сразу после загрузки) ----------
+  // ---------- базовый бэктест (геном по умолчанию) + живой пересчёт ручного ----------
+  const lastBaseKey = useRef("");
   useEffect(() => {
     if (candles.length === 0) {
       setBaseline(null);
@@ -116,12 +153,16 @@ export default function App() {
     const t0 = performance.now();
     const res = runBacktest(candles, tf, defaultParams(), strat);
     setBaseline(res);
-    setManualResult(null);
-    pushLog(
-      `Базовый бэктест (геном по умолчанию): ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)} · ${Math.round(performance.now() - t0)} мс`
-    );
+    setManualResult((prev) => (prev ? runBacktest(candles, tf, sanitizeParams(manual), strat) : null));
+    const key = `${candles.length}|${tf}`;
+    if (key !== lastBaseKey.current) {
+      lastBaseKey.current = key;
+      pushLog(
+        `Базовый бэктест (геном по умолчанию): ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)} · ${Math.round(performance.now() - t0)} мс`
+      );
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, tf]);
+  }, [candles, tf, strat, manual]);
 
   // ---------- ручной бэктест с фиксированным геномом ----------
   const runManual = useCallback(() => {
@@ -209,15 +250,100 @@ export default function App() {
       ? `ОСОБЬ #${previewIdx + 1}`
       : best
         ? "GA · ЛУЧШИЙ ГЕНОМ"
-        : manualResult
-          ? "ФИКС. ПАРАМЕТРЫ"
-          : "БАЗОВЫЙ";
+          : manualResult
+            ? "ФИКС. ПАРАМЕТРЫ"
+            : "БАЗОВЫЙ";
   const m = shown?.metrics;
 
+  // параметры отображаемой особи (для R/R и экспорта)
+  const shownParams = useMemo<Params>(() => {
+    if (previewIdx >= 0 && popRows[previewIdx]) return decodeGenome(popRows[previewIdx].genome);
+    if (best) return decodeGenome(best.row.genome);
+    if (manualResult) return sanitizeParams(manual);
+    return defaultParams();
+  }, [previewIdx, popRows, best, manualResult, manual]);
+
+  const rrSetup = shownParams.tpPct / Math.max(shownParams.slPct, 1e-9);
+  const rrReal = m && m.avgLossPct > 0 ? m.avgWinPct / m.avgLossPct : NaN;
+
+  // ---------- экспорт / импорт параметров особи ----------
+  const toSnake = (k: string) => k.replace(/([A-Z])/g, (c) => "_" + c.toLowerCase());
+
+  const exportIndividual = useCallback(() => {
+    const payload = {
+      app: "QuantEvo Lab",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      source: shownSource,
+      pair,
+      timeframeMin: tf,
+      market: strat.mode,
+      leverage: strat.mode === "linear" ? strat.leverage : 1,
+      genome: Object.fromEntries(GENES.map((g) => [g.key, shownParams[g.key]])),
+      fitness: shownFit ?? null,
+      metrics: m ?? null,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `quantevo_genome_${pair}_${tf}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    pushLog(`Экспорт генома (${shownSource}) → ${a.download}`, "ok");
+  }, [shownParams, shownSource, shownFit, m, pair, tf, strat.mode, strat.leverage, pushLog]);
+
+  const importIndividual = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const j = JSON.parse(String(reader.result)) as {
+            genome?: Record<string, unknown>;
+            params?: Record<string, unknown>;
+          };
+          const src = j.genome ?? j.params;
+          if (!src || typeof src !== "object") throw new Error("no genome");
+          const p: Params = {};
+          for (const g of GENES) {
+            const raw = src[g.key] ?? src[toSnake(g.key)];
+            const v = Number(raw);
+            if (!Number.isFinite(v)) throw new Error(`нет ключа ${g.key}`);
+            p[g.key] = Math.min(g.max, Math.max(g.min, v));
+          }
+          const sp = sanitizeParams(p);
+          setManual(sp);
+          setBest(null);
+          setHistory([]);
+          setPopRows([]);
+          setPreviewIdx(-1);
+          setPreviewResult(null);
+          setBaseline(null);
+          if (candles.length > 0) {
+            const res = runBacktest(candles, tf, sp, strat);
+            setManualResult(res);
+            pushLog(
+              `Импортирован геном из ${file.name}: ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)}`,
+              "ok"
+            );
+          } else {
+            pushLog(`Геном импортирован из ${file.name} — данные ещё не загружены`, "warn");
+          }
+        } catch {
+          pushLog(`Импорт не удался: ${file.name} не похож на геном QuantEvo`, "warn");
+        }
+      };
+      reader.readAsText(file);
+    },
+    [candles, tf, strat, pushLog]
+  );
   const lastC = candles.length ? candles[candles.length - 1].c : null;
   const yearPct = candles.length > 1 ? (candles[candles.length - 1].c / candles[0].c - 1) * 100 : 0;
 
   return (
+    <ErrorBoundary>
     <div className="min-h-screen relative font-body text-ink">
       {/* ambient background */}
       <div className="qe-bg">
@@ -249,7 +375,7 @@ export default function App() {
                 <div className="text-[15px] font-bold text-ink leading-tight">
                   {fmtPrice(lastC)}{" "}
                   <span className={`text-[11px] font-semibold ${yearPct >= 0 ? "text-green" : "text-red"}`}>
-                    {fmtPct(yearPct)} / год
+                    {fmtPct(yearPct)} · {days} дн.
                   </span>
                 </div>
               </div>
@@ -290,7 +416,7 @@ export default function App() {
             </button>
           ))}
           <span className="ml-auto qe-num hidden sm:block text-[10.5px] text-dim">
-            Такенс + EKF · FibDiv · RSI · EMA · бэктест 365 дней
+            Такенс + EKF · FibDiv · RSI · EMA · бэктест до 365 дней · спот/perp
           </span>
         </nav>
 
@@ -313,6 +439,7 @@ export default function App() {
                   manual={manual}
                   onManual={(patch) => setManual((mm) => ({ ...mm, ...patch }) as Params)}
                   onRunManual={runManual}
+                  onImport={importIndividual}
                   running={running}
                   progress={progress}
                   onRun={runEvolution}
@@ -351,7 +478,7 @@ export default function App() {
                 </Panel>
 
                 <Panel
-                  title="Кривая капитала · бэктест 365 дней"
+                  title={`Кривая капитала · бэктест ${days} дней`}
                   tick="teal"
                   className="reveal"
                   style={{ animationDelay: "140ms" }}
@@ -386,8 +513,19 @@ export default function App() {
                   className="reveal"
                   style={{ animationDelay: "120ms" }}
                   right={
-                    <span className="qe-num text-[9.5px] tracking-[0.08em] text-teal border border-teal/40 rounded px-1.5 py-0.5 whitespace-nowrap">
-                      {shownSource}
+                    <span className="flex items-center gap-1.5">
+                      <span className="qe-num text-[9.5px] tracking-[0.08em] text-teal border border-teal/40 rounded px-1.5 py-0.5 whitespace-nowrap">
+                        {shownSource}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={exportIndividual}
+                        title="Скачать параметры особи в JSON"
+                        className="qe-num text-[9.5px] tracking-[0.06em] text-amber2 border border-amber/40 rounded px-1.5 py-0.5 whitespace-nowrap flex items-center gap-1 hover:bg-amber/10 hover:border-amber transition-colors"
+                      >
+                        <IconDownload />
+                        JSON
+                      </button>
                     </span>
                   }
                 >
@@ -400,6 +538,22 @@ export default function App() {
                     <Stat label="Сделок" value={m ? String(m.trades) : "—"} tone="amber" sub={m ? `экспозиция ${(m.exposure * 100).toFixed(0)}%` : undefined} />
                     <Stat label="Фитнес" value={shownFit !== undefined && shownFit !== null ? fmtNum(shownFit) : "—"} tone="amber" sub={previewIdx >= 0 ? `особь #${previewIdx + 1}` : "лучший геном"} />
                     <Stat label="Капитал" value={m ? `$${(10000 * (1 + m.returnPct / 100)).toFixed(0)}` : "—"} tone="ink" sub="со стартовых $10 000" />
+                    <Stat
+                      label="Риск / Награда"
+                      value={Number.isFinite(rrSetup) ? `1 : ${rrSetup.toFixed(2)}` : "—"}
+                      tone="amber"
+                      sub={Number.isFinite(rrReal) ? `реализовано 1 : ${rrReal.toFixed(2)}` : "сетап TP/SL генома"}
+                    />
+                    <Stat
+                      label="Режим рынка"
+                      value={strat.mode === "linear" ? `×${strat.leverage} PERP` : "СПОТ"}
+                      tone="ink"
+                      sub={
+                        strat.mode === "linear"
+                          ? `комиссия ${strat.feePct}% · фандинг ${strat.fundingPct}%/8ч`
+                          : `комиссия ${strat.feePct}% за сторону`
+                      }
+                    />
                   </div>
                 </Panel>
 
@@ -445,5 +599,6 @@ export default function App() {
         </footer>
       </div>
     </div>
+    </ErrorBoundary>
   );
 }

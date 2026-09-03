@@ -1,7 +1,8 @@
+import { useRef } from "react";
 import type { GAConfig } from "../lib/ga";
 import type { StratCfg, Params, GeneDef } from "../lib/backtest";
 import { GENES } from "../lib/backtest";
-import { PAIRS, TIMEFRAMES, type DataSource } from "../lib/data";
+import { PAIRS, TIMEFRAMES, daysForTf, type DataSource } from "../lib/data";
 import { Panel, SliderField, Toggle, Seg, Led, IconPlay, IconStop, IconDice } from "./ui";
 
 export interface DataState {
@@ -24,6 +25,7 @@ interface Props {
   manual: Params;
   onManual: (patch: Partial<Params>) => void;
   onRunManual: () => void;
+  onImport: (f: File) => void;
   running: boolean;
   progress: { gen: number; total: number } | null;
   onRun: () => void;
@@ -69,6 +71,7 @@ export default function ControlPanel(p: Props) {
   const { ga, strat } = p;
   const busy = p.running || p.data.loading;
   const pct = p.progress && p.progress.total > 0 ? (p.progress.gen / p.progress.total) * 100 : 0;
+  const fileRef = useRef<HTMLInputElement>(null);
 
   return (
     <div className="flex flex-col gap-3">
@@ -100,7 +103,7 @@ export default function ControlPanel(p: Props) {
               >
                 {PAIRS.map((s) => (
                   <option key={s} value={s} className="bg-panel">
-                    {s.replace("USDT", "")} / USDT · spot
+                    {s.replace("USDT", "")} / USDT · {strat.mode === "linear" ? "perp" : "spot"}
                   </option>
                 ))}
               </select>
@@ -114,17 +117,54 @@ export default function ControlPanel(p: Props) {
           </label>
 
           <div>
-            <span className="block text-[12px] text-mut mb-1.5">Таймфрейм</span>
+            <span className="block text-[12px] text-mut mb-1.5">Режим торговли</span>
             <Seg
-              options={TIMEFRAMES.map((t) => ({ v: t.min, label: t.label }))}
-              value={p.tf}
-              onChange={p.onTf}
+              options={[
+                { v: "spot", label: "СПОТ" },
+                { v: "linear", label: "ПЛЕЧО · PERP" },
+              ]}
+              value={strat.mode}
+              onChange={(v) => p.onStrat({ mode: v, feePct: v === "spot" ? 0.1 : 0.055 })}
               disabled={busy}
             />
           </div>
 
+          {strat.mode === "linear" ? (
+            <SliderField
+              label="Кредитное плечо"
+              value={strat.leverage}
+              min={1}
+              max={25}
+              step={1}
+              disabled={p.running}
+              fmt={(v) => `×${v}`}
+              onChange={(v) => p.onStrat({ leverage: v })}
+            />
+          ) : null}
+
+          <div>
+            <span className="block text-[12px] text-mut mb-1.5">Таймфрейм</span>
+            <div className="grid grid-cols-6 gap-1">
+              {TIMEFRAMES.map((t) => (
+                <button
+                  key={t.min}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => p.onTf(t.min)}
+                  className={`qe-num text-[10.5px] font-semibold rounded-md border py-1.5 transition-all duration-150 disabled:opacity-45 disabled:cursor-not-allowed ${
+                    p.tf === t.min
+                      ? "border-amber bg-panel2 text-amber2 shadow-[0_0_10px_rgba(242,179,61,0.25)]"
+                      : "border-line bg-bg1 text-dim hover:text-mut hover:border-line2"
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="flex items-center justify-between qe-num text-[10.5px] text-dim">
-            <span>Глубина: 365 дней</span>
+            <span>Глубина: {daysForTf(p.tf)} дн.</span>
             <span>{p.data.count > 0 ? `${p.data.count.toLocaleString("en-US")} свечей` : "нет данных"}</span>
           </div>
 
@@ -216,12 +256,56 @@ export default function ControlPanel(p: Props) {
                 onChange={(e) => p.onStrat({ minTrades: Math.max(1, Number(e.target.value) || 1) })} />
             </label>
           </div>
+          {strat.mode === "linear" ? (
+            <label className="block">
+              <span className="block text-[10.5px] text-dim mb-1">Фандинг, % за 8ч (perp)</span>
+              <input type="number" step="0.005" min="0" max="0.5" className="qe-input w-full" value={strat.fundingPct} disabled={p.running}
+                onChange={(e) => p.onStrat({ fundingPct: Number(e.target.value) || 0 })} />
+            </label>
+          ) : null}
+          <p className="text-[10px] leading-relaxed text-dim">
+            {strat.mode === "linear"
+              ? `Плечо ×${strat.leverage}: PnL и комиссии масштабируются, ликвидация при убытке ~90% маржи.`
+              : "Спот: PnL без плеча, без фандинга и ликвидации."}
+          </p>
         </div>
       </Panel>
 
       {/* ---- ФИКСИРОВАННЫЙ ГЕНОМ ---- */}
-      <Panel title="Фиксированный геном · ручной бэктест" tick="teal">
+      <Panel
+        title="Фиксированный геном · ручной бэктест"
+        tick="teal"
+        right={
+          <>
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              title="Загрузить параметры особи из JSON"
+              className="qe-num text-[9.5px] tracking-[0.06em] text-teal border border-teal/40 rounded px-1.5 py-0.5 hover:bg-teal/10 hover:border-teal transition-colors whitespace-nowrap"
+            >
+              ИМПОРТ .JSON
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) p.onImport(f);
+                e.target.value = "";
+              }}
+            />
+          </>
+        }
+      >
         <div className="p-3.5 flex flex-col gap-3">
+          <div className="qe-num text-[10.5px] text-dim -mt-0.5">
+            Сетап риск/награда по TP/SL:{" "}
+            <span className="text-amber2 font-bold">
+              1 : {(p.manual.tpPct / Math.max(p.manual.slPct, 1e-9)).toFixed(2)}
+            </span>
+          </div>
           <div className="grid grid-cols-2 gap-x-3 gap-y-3">
             {GENES.map((d) =>
               d.log ? (
@@ -260,7 +344,8 @@ export default function ControlPanel(p: Props) {
             БЭКТЕСТ С ЭТИМИ ПАРАМЕТРАМИ
           </button>
           <p className="text-[10px] leading-relaxed text-dim">
-            Мгновенный прогон без эволюции — удобно проверять гипотезы. GA ищет optimum по всем 15 генам одновременно.
+            Мгновенный прогон без эволюции — удобно проверять гипотезы. Импорт понимает JSON веб-лаборатории
+            и best_params.json из Python-скрипта; экспорт особи — кнопка JSON в панели «Метрики бэктеста».
           </p>
         </div>
       </Panel>

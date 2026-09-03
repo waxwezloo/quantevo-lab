@@ -110,14 +110,17 @@ export default function CodePanel() {
             <code className="qe-num text-[11.5px] text-green block leading-relaxed">
               python ga_bybit_trader.py<br />--symbol ETHUSDT --interval 60
             </code>
-            <p className="text-[10.5px] text-dim mt-2 leading-relaxed">Таймфреймы: 60 (1Ч) и 240 (4Ч). Пара — любая spot-пара Bybit, --days 365 по умолчанию.</p>
+            <p className="text-[10.5px] text-dim mt-2 leading-relaxed">Таймфреймы 1м–1Н (60=1Ч, 240=4Ч — основные). Любая пара Bybit, --days 365 по умолчанию.</p>
           </div>
           <div className="reveal bg-bg1 border border-line rounded-lg p-3.5" style={{ animationDelay: "180ms" }}>
             <div className="qe-num text-[10px] text-amber2 mb-1.5">03 · ТЯЖЁЛЫЙ ПРОГОН</div>
             <code className="qe-num text-[11.5px] text-green block leading-relaxed">
               python ga_bybit_trader.py --symbol BTCUSDT --interval 240 --pop 64 --gens 40
             </code>
-            <p className="text-[10.5px] text-dim mt-2 leading-relaxed">Лучший геном и метрики сохраняются в best_params.json. Флаги --allow-short, --mut, --seed.</p>
+            <p className="text-[10.5px] text-dim mt-2 leading-relaxed">
+              Геном и метрики — в best_params.json (импортируется в веб-лабораторию).
+              Флаги: --category linear --leverage, --funding, --import-params, --allow-short, --seed.
+            </p>
           </div>
         </div>
       </Panel>

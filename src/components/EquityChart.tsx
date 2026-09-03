@@ -25,7 +25,15 @@ export default function EquityChart({ equity, bench, times, loading }: Props) {
     return () => ro.disconnect();
   }, []);
 
-  const n = equity ? equity.length : 0;
+  // защита от рассинхрона длин при смене пары/таймфрейма:
+  // старая кривая капитала не должна быть длиннее новых данных
+  const n = equity
+    ? Math.min(
+        equity.length,
+        times.length > 0 ? times.length : equity.length,
+        bench ? bench.length : equity.length
+      )
+    : 0;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -173,7 +181,7 @@ export default function EquityChart({ equity, bench, times, loading }: Props) {
           <span className="text-dim">{fmtDate(times[hi] ?? 0)}</span>
           {" · Капитал "}
           <span className="text-amber2">${equity[hi].toFixed(0)}</span>
-          {bench ? (
+          {bench && Number.isFinite(bench[hi]) ? (
             <>
               {" · B&H "}
               <span className="text-mut">${bench[hi].toFixed(0)}</span>

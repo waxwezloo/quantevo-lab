@@ -1,0 +1,464 @@
+// ============================================================
+// QuantEvo Lab — стратегия FibDiv + бэктест + фитнес
+// Вход: цена в Фибо-зоне ретрейсмента + RSI-дивергенция +
+// Такенс-импульс (EKF) + трендовый фильтр EMA.
+// Исполнение на открытии следующего бара, TP/SL внутри бара,
+// комиссия и проскальзывание, фандинг (perp), ликвидация,
+// реверс-выход по противоположному сигналу.
+// ============================================================
+
+import type { Candle } from "./indicators";
+import {
+  ema,
+  rsiWilder,
+  findPivots,
+  takensMomentum,
+  divergenceFlags,
+  fibZones,
+} from "./indicators";
+
+export interface GeneDef {
+  key: string;
+  label: string;
+  min: number;
+  max: number;
+  int?: boolean;
+  log?: boolean;
+  unit?: string;
+}
+
+export const GENES: GeneDef[] = [
+  { key: "rsiPeriod", label: "RSI · период", min: 6, max: 36, int: true, unit: "бар" },
+  { key: "rsiLow", label: "RSI · перепроданность", min: 15, max: 42, int: true },
+  { key: "rsiHigh", label: "RSI · перекупленность", min: 58, max: 85, int: true },
+  { key: "emaFast", label: "EMA быстрая", min: 8, max: 60, int: true, unit: "бар" },
+  { key: "emaSlow", label: "EMA медленная", min: 70, max: 260, int: true, unit: "бар" },
+  { key: "takensDelay", label: "Такенс τ · лаг", min: 1, max: 12, int: true },
+  { key: "takensDim", label: "Такенс m · размерность", min: 2, max: 6, int: true },
+  { key: "kalmanQ", label: "EKF · шум процесса Q", min: 1e-5, max: 3e-2, log: true },
+  { key: "momThr", label: "Порог Такенс-импульса", min: 0, max: 1.6 },
+  { key: "divLookback", label: "Окно дивергенции", min: 10, max: 90, int: true, unit: "бар" },
+  { key: "swingLen", label: "Плечо свинга", min: 3, max: 14, int: true, unit: "бар" },
+  { key: "fibLo", label: "Фибо-зона · от", min: 0.2, max: 0.5 },
+  { key: "fibHi", label: "Фибо-зона · до", min: 0.55, max: 0.85 },
+  { key: "tpPct", label: "Тейк-профит", min: 0.6, max: 9, unit: "%" },
+  { key: "slPct", label: "Стоп-лосс", min: 0.4, max: 7, unit: "%" },
+];
+
+export type Genome = number[];
+export type Params = Record<string, number>;
+
+export function decodeGenome(g: Genome): Params {
+  const p: Params = {};
+  GENES.forEach((d, i) => {
+    p[d.key] = d.int ? Math.round(g[i]) : g[i];
+  });
+  if (p.emaFast >= p.emaSlow) {
+    p.emaFast = Math.max(GENES[3].min, Math.min(p.emaFast, p.emaSlow - 12));
+    p.emaSlow = Math.min(GENES[4].max, Math.max(p.emaSlow, p.emaFast + 12));
+  }
+  if (p.fibLo >= p.fibHi) {
+    const mid = (p.fibLo + p.fibHi) / 2;
+    p.fibLo = Math.max(0.2, mid - 0.06);
+    p.fibHi = Math.min(0.85, mid + 0.06);
+  }
+  return p;
+}
+
+export interface StratCfg {
+  mode: "spot" | "linear";
+  leverage: number;
+  allowShort: boolean;
+  trendFilter: boolean;
+  feePct: number;
+  slipPct: number;
+  fundingPct: number; // % за 8ч, только linear
+  minTrades: number;
+}
+
+export interface Trade {
+  dir: 1 | -1;
+  entryI: number;
+  exitI: number;
+  entryP: number;
+  exitP: number;
+  pnlPct: number;
+  reason: string;
+}
+
+export interface Metrics {
+  returnPct: number;
+  cagr: number;
+  sharpe: number;
+  sortino: number;
+  maxDD: number;
+  winRate: number;
+  pf: number;
+  trades: number;
+  avgPct: number;
+  avgWinPct: number;
+  avgLossPct: number;
+  exposure: number;
+}
+
+export interface BacktestResult {
+  equity: number[];
+  trades: Trade[];
+  metrics: Metrics;
+}
+
+const START_EQ = 10000;
+
+// ------------------------------------------------------------
+// Расчёт сигналов стратегии (общий для бэктеста и live-движка)
+// ------------------------------------------------------------
+export interface SignalData {
+  longSig: Uint8Array;
+  shortSig: Uint8Array;
+  rsi: number[];
+  emaF: number[];
+  emaS: number[];
+  warm: number;
+}
+
+export function computeSignals(
+  candles: Candle[],
+  p: Params,
+  cfg: Pick<StratCfg, "allowShort" | "trendFilter">
+): SignalData {
+  const n = candles.length;
+  const high = new Array<number>(n);
+  const low = new Array<number>(n);
+  const close = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    high[i] = candles[i].h;
+    low[i] = candles[i].l;
+    close[i] = candles[i].c;
+  }
+  const emaF = ema(close, p.emaFast);
+  const emaS = ema(close, p.emaSlow);
+  const rsi = rsiWilder(close, p.rsiPeriod);
+  const mom = takensMomentum(close, p.takensDelay, p.takensDim, p.kalmanQ);
+
+  const swingLen = Math.max(2, Math.round(p.swingLen));
+  const { lows, highs } = findPivots(high, low, swingLen);
+  const bullDiv = divergenceFlags(lows, rsi, p.divLookback, n, "bull", swingLen);
+  const bearDiv = divergenceFlags(highs, rsi, p.divLookback, n, "bear", swingLen);
+  const life = Math.round(p.divLookback) * 2 + 30;
+  const longZ = fibZones(highs, lows, p.fibLo, p.fibHi, life, swingLen, n, "long");
+  const shortZ = fibZones(highs, lows, p.fibLo, p.fibHi, life, swingLen, n, "short");
+
+  const longSig = new Uint8Array(n);
+  const shortSig = new Uint8Array(n);
+  for (let t = 0; t < n; t++) {
+    const loL = longZ.lo[t];
+    if (
+      !Number.isNaN(loL) &&
+      close[t] >= loL &&
+      close[t] <= longZ.hi[t] &&
+      bullDiv[t] &&
+      mom[t] > p.momThr &&
+      rsi[t] < p.rsiHigh &&
+      (!cfg.trendFilter || emaF[t] > emaS[t])
+    ) {
+      longSig[t] = 1;
+    }
+    const loS = shortZ.lo[t];
+    if (
+      cfg.allowShort &&
+      !Number.isNaN(loS) &&
+      close[t] >= loS &&
+      close[t] <= shortZ.hi[t] &&
+      bearDiv[t] &&
+      mom[t] < -p.momThr &&
+      rsi[t] > p.rsiLow &&
+      (!cfg.trendFilter || emaF[t] < emaS[t])
+    ) {
+      shortSig[t] = 1;
+    }
+  }
+
+  const warm = Math.max(
+    p.emaSlow + 5,
+    p.rsiPeriod + 5,
+    (Math.round(p.takensDim) - 1) * Math.round(p.takensDelay) + 60,
+    swingLen * 2 + 5
+  );
+  return { longSig, shortSig, rsi, emaF, emaS, warm };
+}
+
+export function runBacktest(
+  candles: Candle[],
+  tfMinutes: number,
+  p: Params,
+  cfg: StratCfg
+): BacktestResult {
+  const n = candles.length;
+  const open = new Array<number>(n);
+  const high = new Array<number>(n);
+  const low = new Array<number>(n);
+  const close = new Array<number>(n);
+  for (let i = 0; i < n; i++) {
+    open[i] = candles[i].o;
+    high[i] = candles[i].h;
+    low[i] = candles[i].l;
+    close[i] = candles[i].c;
+  }
+
+  const sig = computeSignals(candles, p, cfg);
+  const { longSig, shortSig, rsi, warm } = sig;
+
+  const fee = cfg.feePct / 100;
+  const slip = cfg.slipPct / 100;
+  const lev = cfg.mode === "linear" ? Math.max(1, cfg.leverage) : 1;
+  const fundingPerBar = cfg.mode === "linear" ? (cfg.fundingPct / 100) * (tfMinutes / 480) * lev : 0;
+  const liqMove = lev > 1 ? 0.9 / lev : Infinity;
+
+  const equity = new Array<number>(n).fill(START_EQ);
+  const trades: Trade[] = [];
+  let eq = START_EQ;
+  let pos: 0 | 1 | -1 = 0;
+  let entryP = 0;
+  let entryI = 0;
+  let tp = 0;
+  let sl = 0;
+  let pendingDir: 0 | 1 | -1 = 0;
+  let barsInPos = 0;
+  let barsHeld = 0;
+  let worst = 0;
+
+  for (let t = warm; t < n; t++) {
+    const c = close[t];
+    // исполнение отложенного входа по открытию бара
+    if (pendingDir !== 0) {
+      const o = open[t] * (1 + slip * pendingDir);
+      entryP = o;
+      entryI = t;
+      pos = pendingDir;
+      pendingDir = 0;
+      tp = pos === 1 ? o * (1 + p.tpPct / 100) : o * (1 - p.tpPct / 100);
+      sl = pos === 1 ? o * (1 - p.slPct / 100) : o * (1 + p.slPct / 100);
+      barsHeld = 0;
+      worst = 0;
+    }
+
+    if (pos !== 0) {
+      barsInPos++;
+      barsHeld++;
+      const adv = pos === 1 ? (entryP - low[t]) / entryP : (high[t] - entryP) / entryP;
+      if (adv > worst) worst = adv;
+      let exitP = 0;
+      let reason = "";
+      if (worst >= liqMove) {
+        exitP = pos === 1 ? entryP * (1 - liqMove) : entryP * (1 + liqMove);
+        reason = "LIQ";
+      } else if (pos === 1) {
+        if (low[t] <= sl) {
+          exitP = sl;
+          reason = "SL";
+        } else if (high[t] >= tp) {
+          exitP = tp;
+          reason = "TP";
+        }
+      } else {
+        if (high[t] >= sl) {
+          exitP = sl;
+          reason = "SL";
+        } else if (low[t] <= tp) {
+          exitP = tp;
+          reason = "TP";
+        }
+      }
+      if (exitP === 0) {
+        const rev = pos === 1 ? shortSig[t] : longSig[t];
+        if (rev) {
+          exitP = c;
+          reason = "REV";
+        } else if (pos === 1 && rsi[t] > p.rsiHigh + 6) {
+          exitP = c;
+          reason = "RSI";
+        } else if (pos === -1 && rsi[t] < p.rsiLow - 6) {
+          exitP = c;
+          reason = "RSI";
+        }
+      }
+      if (exitP > 0) {
+        const gross = (pos * (exitP - entryP)) / entryP;
+        let net: number;
+        if (reason === "LIQ") {
+          net = -0.9; // ликвидация: потеря ~90% маржи позиции
+        } else {
+          net = lev * gross - 2 * fee * lev - fundingPerBar * barsHeld;
+          net = Math.max(net, -0.98);
+        }
+        eq *= 1 + net;
+        trades.push({
+          dir: pos,
+          entryI,
+          exitI: t,
+          entryP,
+          exitP,
+          pnlPct: net * 100,
+          reason,
+        });
+        pos = 0;
+      }
+    }
+
+    if (pos === 0 && pendingDir === 0 && t + 1 < n) {
+      if (longSig[t]) pendingDir = 1;
+      else if (shortSig[t]) pendingDir = -1;
+    }
+
+    equity[t] =
+      pos === 0
+        ? eq
+        : eq * (1 + Math.max(lev * pos * ((c - entryP) / entryP), -0.9) - fee * lev);
+  }
+
+  if (pos !== 0) {
+    const exitP = close[n - 1];
+    const gross = (pos * (exitP - entryP)) / entryP;
+    const net = Math.max(lev * gross - 2 * fee * lev - fundingPerBar * barsHeld, -0.98);
+    eq *= 1 + net;
+    trades.push({
+      dir: pos,
+      entryI,
+      exitI: n - 1,
+      entryP,
+      exitP,
+      pnlPct: net * 100,
+      reason: "EOD",
+    });
+    equity[n - 1] = eq;
+  }
+
+  return { equity, trades, metrics: computeMetrics(equity, trades, n, tfMinutes, barsInPos) };
+}
+
+export function computeMetrics(
+  equity: number[],
+  trades: Trade[],
+  n: number,
+  tfMinutes: number,
+  barsInPos: number
+): Metrics {
+  const ppy = (365 * 24 * 60) / tfMinutes;
+  const final = equity[n - 1];
+  const returnPct = (final / START_EQ - 1) * 100;
+  const cagr = n > 0 ? Math.pow(Math.max(final / START_EQ, 1e-6), ppy / n) - 1 : 0;
+
+  let mean = 0;
+  let cnt = 0;
+  const rets: number[] = [];
+  for (let i = 1; i < n; i++) {
+    const r = equity[i] / equity[i - 1] - 1;
+    rets.push(r);
+    mean += r;
+    cnt++;
+  }
+  mean = cnt ? mean / cnt : 0;
+  let varr = 0;
+  let downVar = 0;
+  let downCnt = 0;
+  for (const r of rets) {
+    varr += (r - mean) * (r - mean);
+    if (r < 0) {
+      downVar += r * r;
+      downCnt++;
+    }
+  }
+  const sd = cnt > 1 ? Math.sqrt(varr / (cnt - 1)) : 0;
+  const dd = downCnt > 0 ? Math.sqrt(downVar / Math.max(cnt, 1)) : 0;
+  const sharpe = sd > 0 ? (mean / sd) * Math.sqrt(ppy) : 0;
+  const sortino = dd > 0 ? (mean / dd) * Math.sqrt(ppy) : 0;
+
+  let peak = -Infinity;
+  let maxDD = 0;
+  for (let i = 0; i < n; i++) {
+    if (equity[i] > peak) peak = equity[i];
+    const d = 1 - equity[i] / peak;
+    if (d > maxDD) maxDD = d;
+  }
+
+  let wins = 0;
+  let grossW = 0;
+  let grossL = 0;
+  let sumPct = 0;
+  for (const tr of trades) {
+    sumPct += tr.pnlPct;
+    if (tr.pnlPct > 0) {
+      wins++;
+      grossW += tr.pnlPct;
+    } else grossL += -tr.pnlPct;
+  }
+  const nt = trades.length;
+  return {
+    returnPct,
+    cagr: cagr * 100,
+    sharpe,
+    sortino,
+    maxDD,
+    winRate: nt ? (wins / nt) * 100 : 0,
+    pf: grossL > 0 ? grossW / grossL : grossW > 0 ? 99 : 0,
+    trades: nt,
+    avgPct: nt ? sumPct / nt : 0,
+    avgWinPct: wins ? grossW / wins : 0,
+    avgLossPct: nt - wins > 0 ? grossL / (nt - wins) : 0,
+    exposure: n ? barsInPos / n : 0,
+  };
+}
+
+// ---------- фитнес ----------
+export interface GAWeights {
+  sharpe: number;
+  pf: number;
+  ret: number;
+  dd: number;
+}
+
+export function fitness(m: Metrics, w: GAWeights, minTrades: number): number {
+  if (m.trades < minTrades) return -25 - (minTrades - m.trades) * 0.8;
+  const sh = clamp(m.sharpe, -4, 6);
+  const pfT = Math.log(clamp(m.pf, 0.05, 30));
+  const rt = clamp(m.returnPct / 100, -3, 8);
+  const score =
+    w.sharpe * sh + w.pf * pfT + w.ret * rt - w.dd * m.maxDD * 10 + 0.5 * Math.log10(m.trades + 1);
+  return clamp(score, -60, 60);
+}
+
+function clamp(x: number, a: number, b: number): number {
+  return Math.min(b, Math.max(a, x));
+}
+
+export function fmtPrice(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  if (v >= 1000) return v.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  if (v >= 1) return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (v >= 0.01) return v.toLocaleString("en-US", { maximumFractionDigits: 5 });
+  return v.toLocaleString("en-US", { maximumFractionDigits: 8 });
+}
+
+// Параметры «по умолчанию» — середины допустимых диапазонов генов
+export function defaultParams(): Params {
+  const g: Genome = GENES.map((d) => {
+    const mid = d.log ? Math.sqrt(d.min * d.max) : (d.min + d.max) / 2;
+    return d.int ? Math.round(mid) : mid;
+  });
+  return decodeGenome(g);
+}
+
+// Приведение параметров к корректным соотношениям (EMA fast < slow, fibLo < fibHi)
+export function sanitizeParams(p: Params): Params {
+  const out: Params = { ...p };
+  if (out.emaFast >= out.emaSlow) {
+    out.emaFast = Math.max(8, Math.min(out.emaFast, out.emaSlow - 12));
+    out.emaSlow = Math.min(260, Math.max(out.emaSlow, out.emaFast + 12));
+  }
+  if (out.fibLo >= out.fibHi) {
+    const mid = (out.fibLo + out.fibHi) / 2;
+    out.fibLo = Math.max(0.2, mid - 0.06);
+    out.fibHi = Math.min(0.85, mid + 0.06);
+  }
+  return out;
+}

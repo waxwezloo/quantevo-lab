@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # QuantEvo Lab — генетическая лаборатория алго-трейдинга Bybit
 
 [![Deploy to GitHub Pages](https://github.com/waxwezloo/quantevo-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml)
@@ -281,3 +282,6 @@ quantevo-lab/
 ## Лицензия
 
 [MIT](LICENSE) — свободное использование с указанием авторства.
+=======
+# quantevo-lab
+>>>>>>> f837c3d6d33d9194a1f91787f58b1e16c8dd00ab

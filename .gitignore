@@ -1,5 +1,39 @@
+# dependencies
 node_modules/
-.next/
+
+# build
 dist/
 build/
+
+# environment & secrets
+.env
+.env.local
+.env.*.local
+python/.env
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.mypy_cache/
+
+# logs
 *.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# trading artifacts
+best_params.json
+quantevo_genome_*.json
+.next/

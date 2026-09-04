@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <title>QuantEvo Lab</title>
+    <script>
+      // SPA-редирект для GitHub Pages: /repo/любой-путь -> /repo/#/любой-путь
+      var l = window.location;
+      var base = l.pathname.replace(/\/[^/]*$/, "/");
+      l.replace(l.protocol + "//" + l.host + base + "#/" + l.pathname.slice(base.length) + l.search);
+    </script>
+  </head>
+  <body></body>
+</html>

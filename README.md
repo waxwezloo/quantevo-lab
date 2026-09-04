@@ -1,6 +1,6 @@
 # QuantEvo Lab — генетическая лаборатория алго-трейдинга Bybit
 
-[![Deploy to GitHub Pages](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml)
+[![Deploy to GitHub Pages](https://github.com/waxwezloo/quantevo-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f2b33d.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3bc9c4.svg)](python/)
 [![Bybit API V5](https://img.shields.io/badge/Bybit-API%20V5-6fa8ff.svg)](https://bybit-exchange.github.io/docs/v5/intro)
@@ -54,7 +54,7 @@
 Требования: **Node.js 20+**, npm 10+.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/quantevo-lab.git
+git clone https://github.com/waxwezloo/quantevo-lab.git
 cd quantevo-lab
 npm install
 npm run dev          # http://localhost:3000
@@ -79,7 +79,7 @@ npm run preview      # локальный просмотр сборки
 
 1. Запушьте репозиторий в `main`;
 2. **Settings → Pages → Source: GitHub Actions** (включится после первого push);
-3. Через 1–2 минуты сайт будет на `https://YOUR_USERNAME.github.io/quantevo-lab/`.
+3. Через 1–2 минуты сайт будет на `https://waxwezloo.github.io/quantevo-lab/`.
 
 Workflow собирает проект с относительным base (`vite build --base=./`), поэтому работает и на поддомене, и в подкаталоге. `public/404.html` обеспечивает SPA-навигацию.
 

@@ -7,9 +7,16 @@ import FitnessChart from "./components/FitnessChart";
 import PopulationTable from "./components/PopulationTable";
 import CodePanel from "./components/CodePanel";
 import TradingTab, { type DeployReq } from "./components/TradingTab";
-import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, IconTrade, IconTrophy, IconDownload, fmtPct, fmtNum } from "./components/ui";
 import LeaderboardTab from "./components/LeaderboardTab";
+import FaqPanel from "./components/FaqPanel";
+import HelpIcon from "./components/HelpIcon";
+import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, IconTrade, IconDownload, IconTrophy, fmtPct, fmtNum } from "./components/ui";
 import { loadKlines, TIMEFRAMES, daysForTf } from "./lib/data";
+import type { Candle } from "./lib/indicators";
+import { ema, rsiWilder } from "./lib/indicators";
+import type { StratCfg, BacktestResult, Params } from "./lib/backtest";
+import { runBacktest, decodeGenome, fmtPrice, defaultParams, sanitizeParams, GENES } from "./lib/backtest";
+import { DEFAULT_GA, evolve, type GAConfig, type GenInfo, type PopRow } from "./lib/ga";
 import {
   loadLeaders,
   saveLeaders,
@@ -20,11 +27,6 @@ import {
   type Leader,
   type LeaderUpdate,
 } from "./lib/leaders";
-import type { Candle } from "./lib/indicators";
-import { ema, rsiWilder } from "./lib/indicators";
-import type { StratCfg, BacktestResult, Params } from "./lib/backtest";
-import { runBacktest, decodeGenome, fmtPrice, defaultParams, sanitizeParams, GENES } from "./lib/backtest";
-import { DEFAULT_GA, evolve, type GAConfig, type GenInfo, type PopRow } from "./lib/ga";
 
 interface LogLine {
   id: number;
@@ -35,7 +37,6 @@ interface LogLine {
 
 let logId = 0;
 
-// Перехват ошибок рендера: вместо белого экрана — диагностическая панель
 class ErrorBoundary extends Component<{ children: ReactNode }, { err: Error | null }> {
   state: { err: Error | null } = { err: null };
   static getDerivedStateFromError(err: Error) {
@@ -65,6 +66,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { err: Error | nu
 
 export default function App() {
   const [tab, setTab] = useState<"lab" | "trading" | "leaderboard" | "code">("lab");
+  const [showFaq, setShowFaq] = useState(false);
   const [pair, setPair] = useState("BTCUSDT");
   const [tf, setTf] = useState(60);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -86,17 +88,22 @@ export default function App() {
   const [manualResult, setManualResult] = useState<BacktestResult | null>(null);
   const [baseline, setBaseline] = useState<BacktestResult | null>(null);
 
-  // ---------- Leaderboard ----------
   const [leaders, setLeaders] = useState<Leader[]>(() => loadLeaders());
   const [deployReq, setDeployReq] = useState<DeployReq | null>(null);
   const [tradingRunning, setTradingRunning] = useState(false);
   const [marketWarn, setMarketWarn] = useState<{ to: "spot" | "linear"; rest: Partial<StratCfg> } | null>(null);
 
-  useEffect(() => {
-    saveLeaders(leaders);
-  }, [leaders]);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<{ gen: number; total: number } | null>(null);
+  const [history, setHistory] = useState<GenInfo[]>([]);
+  const [popRows, setPopRows] = useState<PopRow[]>([]);
+  const [best, setBest] = useState<{ row: PopRow; result: BacktestResult } | null>(null);
+  const [previewIdx, setPreviewIdx] = useState(-1);
+  const [previewResult, setPreviewResult] = useState<BacktestResult | null>(null);
 
   const [log, setLog] = useState<LogLine[]>([]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const stopRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const pushLog = useCallback((msg: string, kind: LogLine["kind"] = "info") => {
@@ -109,6 +116,10 @@ export default function App() {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [log]);
+
+  useEffect(() => {
+    saveLeaders(leaders);
+  }, [leaders]);
 
   const handleLeaderUpdate = useCallback((id: string, upd: LeaderUpdate) => {
     setLeaders((prev) => prev.map((l) => (l.id === id ? applyLeaderUpdate(l, upd) : l)));
@@ -141,7 +152,6 @@ export default function App() {
 
   const handleDeployLeader = useCallback(
     (l: Leader, switchMarket: boolean) => {
-      // режим рынка уже подтверждён в диалоге Leaderboard
       if (switchMarket) {
         setStrat((s) => ({
           ...s,
@@ -206,7 +216,6 @@ export default function App() {
     }));
   }, []);
 
-  // смена спот ↔ фьючерсы из любых настроек — с предупреждением
   const handleStratPatch = useCallback(
     (patch: Partial<StratCfg>) => {
       if (patch.mode && patch.mode !== strat.mode) {
@@ -218,21 +227,9 @@ export default function App() {
     [strat.mode]
   );
 
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState<{ gen: number; total: number } | null>(null);
-  const [history, setHistory] = useState<GenInfo[]>([]);
-  const [popRows, setPopRows] = useState<PopRow[]>([]);
-  const [best, setBest] = useState<{ row: PopRow; result: BacktestResult } | null>(null);
-  const [previewIdx, setPreviewIdx] = useState(-1);
-  const [previewResult, setPreviewResult] = useState<BacktestResult | null>(null);
-
-  const [reloadKey, setReloadKey] = useState(0);
-  const stopRef = useRef(false);
-
   const tfLabel = TIMEFRAMES.find((t) => t.min === tf)?.label ?? "1Ч";
   const days = daysForTf(tf);
 
-  // ---------- загрузка данных ----------
   useEffect(() => {
     let cancelled = false;
     setDataState((s) => ({ ...s, loading: true, count: 0 }));
@@ -254,10 +251,8 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pair, tf, reloadKey, strat.mode]);
+  }, [pair, tf, reloadKey, strat.mode, pushLog, days, tfLabel]);
 
-  // ---------- индикаторы для отображения ----------
   const view = useMemo(() => {
     if (candles.length === 0) return null;
     const close = candles.map((c) => c.c);
@@ -272,7 +267,6 @@ export default function App() {
 
   const times = useMemo(() => candles.map((c) => c.t), [candles]);
 
-  // ---------- базовый бэктест (геном по умолчанию) + живой пересчёт ручного ----------
   const lastBaseKey = useRef("");
   useEffect(() => {
     if (candles.length === 0) {
@@ -290,10 +284,8 @@ export default function App() {
         `Базовый бэктест (геном по умолчанию): ${res.metrics.trades} сделок, доход ${fmtPct(res.metrics.returnPct)} · ${Math.round(performance.now() - t0)} мс`
       );
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, tf, strat, manual]);
+  }, [candles, tf, strat, manual, pushLog]);
 
-  // ---------- ручной бэктест с фиксированным геномом ----------
   const runManual = useCallback(() => {
     if (running || candles.length === 0) return;
     const res = runBacktest(candles, tf, sanitizeParams(manual), strat);
@@ -309,7 +301,6 @@ export default function App() {
     );
   }, [running, candles, tf, manual, strat, pushLog]);
 
-  // ---------- эволюция ----------
   const runEvolution = useCallback(async () => {
     if (running || candles.length === 0) return;
     stopRef.current = false;
@@ -356,8 +347,7 @@ export default function App() {
         m.returnPct >= 0 ? "ok" : "warn"
       );
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, candles, tf, strat, ga, pair, tfLabel, pushLog]);
+  }, [running, candles, tf, strat, ga, pair, tfLabel, pushLog, addLeader]);
 
   const onPreview = useCallback(
     (i: number) => {
@@ -388,7 +378,6 @@ export default function App() {
           : "БАЗОВЫЙ";
   const m = shown?.metrics;
 
-  // параметры отображаемой особи (для R/R и экспорта)
   const shownParams = useMemo<Params>(() => {
     if (previewIdx >= 0 && popRows[previewIdx]) return decodeGenome(popRows[previewIdx].genome);
     if (best) return decodeGenome(best.row.genome);
@@ -404,7 +393,6 @@ export default function App() {
   const rrSetup = shownParams.tpPct / Math.max(shownParams.slPct, 1e-9);
   const rrReal = m && m.avgLossPct > 0 ? m.avgWinPct / m.avgLossPct : NaN;
 
-  // ---------- экспорт / импорт параметров особи ----------
   const toSnake = (k: string) => k.replace(/([A-Z])/g, (c) => "_" + c.toLowerCase());
 
   const exportIndividual = useCallback(() => {
@@ -484,7 +472,6 @@ export default function App() {
   return (
     <ErrorBoundary>
     <div className="min-h-screen relative font-body text-ink">
-      {/* ambient background */}
       <div className="qe-bg">
         <div className="qe-grid" />
         <div className="qe-glow qe-glow-a" />
@@ -492,7 +479,6 @@ export default function App() {
       </div>
 
       <div className="relative z-10">
-        {/* ---------- header ---------- */}
         <header className="px-4 pt-4 pb-3 max-w-[1660px] mx-auto flex flex-wrap items-center gap-x-5 gap-y-2">
           <div className="flex items-center gap-3">
             <IconHelix size={38} />
@@ -527,12 +513,23 @@ export default function App() {
                 {dataState.loading ? "ПОДКЛЮЧЕНИЕ…" : dataState.source === "bybit" ? "BYBIT V5 · LIVE DATA" : "СИНТЕТИЧЕСКИЙ РЕЖИМ"}
               </span>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowFaq(true)}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-amber/40 bg-amber/10 text-amber2 hover:bg-amber/20 hover:border-amber transition-colors qe-num text-[11px] font-semibold"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                <path d="M12 17h.01" />
+              </svg>
+              FAQ
+            </button>
           </div>
         </header>
 
         <TickerTape active={pair} onSelect={(s) => setPair(s)} />
 
-        {/* ---------- tabs ---------- */}
         <nav className="max-w-[1660px] mx-auto px-4 mt-3 flex items-center gap-1.5">
           {(
             [
@@ -560,8 +557,6 @@ export default function App() {
           </span>
         </nav>
 
-        {/* ---------- content ---------- */}
-        {/* вкладки остаются смонтированными (hidden), чтобы торговый движок не прерывался */}
         <div className={tab === "lab" ? "" : "hidden"}>
           <main className="max-w-[1660px] mx-auto px-4 pb-6 reveal">
             <div className="grid gap-3 grid-cols-1 lg:grid-cols-[290px_minmax(0,1fr)] xl:grid-cols-[290px_minmax(0,1fr)_308px] items-start">
@@ -759,7 +754,6 @@ export default function App() {
           </main>
         </div>
 
-        {/* ---------- предупреждение: смена спот ↔ фьючерсы ---------- */}
         {marketWarn ? (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-bg0/80 backdrop-blur-sm"
@@ -809,7 +803,8 @@ export default function App() {
           </div>
         ) : null}
 
-        {/* ---------- footer ---------- */}
+        {showFaq ? <FaqPanel onClose={() => setShowFaq(false)} /> : null}
+
         <footer className="border-t border-line/70 bg-bg0/70">
           <div className="max-w-[1660px] mx-auto px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1 qe-num text-[10px] text-dim">
             <span>QuantEvo Lab · метод Такенса (delay-embedding) + расширенный фильтр Калмана</span>

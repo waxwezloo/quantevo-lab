@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import PriceChart from "./PriceChart";
 import { Panel, Seg, SliderField, Toggle, Led, IconPlay, IconStop, fmtPct } from "./ui";
 import { TradingEngine, testConnection, type TradingCfg, type TradeRec } from "../lib/trading";
@@ -6,6 +6,17 @@ import type { Params, StratCfg, Trade } from "../lib/backtest";
 import { fmtPrice } from "../lib/backtest";
 import { PAIRS, TIMEFRAMES } from "../lib/data";
 import type { Candle } from "../lib/indicators";
+import type { LeaderUpdate } from "../lib/leaders";
+
+// Запрос из Leaderboard: отправить стратегию лидера в торговлю
+export interface DeployReq {
+  reqId: number;
+  leaderId: string;
+  genome: Params;
+  market: "spot" | "linear";
+  leverage: number;
+  switchMarket: boolean;
+}
 
 interface Props {
   pair: string;
@@ -15,6 +26,10 @@ interface Props {
   strat: StratCfg;
   manual: Params;
   bestParams: Params | null;
+  deployReq: DeployReq | null;
+  onLeaderUpdate: (id: string, upd: LeaderUpdate) => void;
+  onMarketSwitch: (market: "spot" | "linear", leverage: number) => void;
+  onEngineRunning: (running: boolean) => void;
 }
 
 function timeToIdx(candles: Candle[], t: number): number {
@@ -100,7 +115,19 @@ function EquitySpark({ deposit, trades, equity }: { deposit: number; trades: Tra
   );
 }
 
-export default function TradingTab({ pair, tf, onPair, onTf, strat, manual, bestParams }: Props) {
+export default function TradingTab({
+  pair,
+  tf,
+  onPair,
+  onTf,
+  strat,
+  manual,
+  bestParams,
+  deployReq,
+  onLeaderUpdate,
+  onMarketSwitch,
+  onEngineRunning,
+}: Props) {
   const [deposit, setDeposit] = useState(10000);
   const [riskPct, setRiskPct] = useState(1);
   const [pollSec, setPollSec] = useState(20);
@@ -108,11 +135,19 @@ export default function TradingTab({ pair, tf, onPair, onTf, strat, manual, best
   const [testnet, setTestnet] = useState(true);
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [source, setSource] = useState<"manual" | "best">("manual");
+  const [source, setSource] = useState<"manual" | "best" | "leader">("manual");
   const [testing, setTesting] = useState(false);
   const [conn, setConn] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [leaderGenome, setLeaderGenome] = useState<Params | null>(null);
+  const [leaderId, setLeaderId] = useState<string | null>(null);
+  const [pendingLeaderId, setPendingLeaderId] = useState<string | null>(null);
 
-  const srcParams: Params = source === "best" && bestParams ? bestParams : manual;
+  const srcParams: Params =
+    source === "leader" && leaderGenome
+      ? leaderGenome
+      : source === "best" && bestParams
+        ? bestParams
+        : manual;
 
   const makeCfg = (): TradingCfg => ({
     pair,
@@ -136,25 +171,108 @@ export default function TradingTab({ pair, tf, onPair, onTf, strat, manual, best
   const [engine, setEngine] = useState<TradingEngine>(() => new TradingEngine(makeCfg()));
   const snap = useSyncExternalStore(engine.subscribe, engine.getSnapshot);
 
-  // синхронизация настроек с движком
-  useEffect(() => {
-    engine.updateCfg(makeCfg());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engine, pair, tf, deposit, riskPct, pollSec, mode, testnet, apiKey, apiSecret, source, bestParams, manual, strat]);
+  // ---------- live-статистика лидера (Leaderboard) ----------
+  const baseRef = useRef<{ id: string | null; realized: number; trades: number; startedAt: number }>({
+    id: null,
+    realized: 0,
+    trades: 0,
+    startedAt: 0,
+  });
 
-  // смена пары/таймфрейма — перезапуск движка
+  const activateLeader = useCallback(
+    (id: string) => {
+      const sn = engine.getSnapshot();
+      baseRef.current = {
+        id,
+        realized: sn.trades.reduce((s, t) => s + t.pnl, 0),
+        trades: sn.trades.length,
+        startedAt: Date.now(),
+      };
+      onLeaderUpdate(id, { active: true, liveStartedAt: Date.now(), queued: false });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [onLeaderUpdate]
+  );
+
+  const deactivateLeader = useCallback(() => {
+    const b = baseRef.current;
+    if (!b.id) return;
+    const sn = engine.getSnapshot();
+    const realized = sn.trades.reduce((s, t) => s + t.pnl, 0);
+    onLeaderUpdate(b.id, {
+      active: false,
+      liveStartedAt: null,
+      queued: false,
+      addLiveMs: Date.now() - b.startedAt,
+      addLiveProfit: realized - b.realized,
+      addLiveTrades: sn.trades.length - b.trades,
+    });
+    baseRef.current = { id: null, realized: 0, trades: 0, startedAt: 0 };
+  }, [onLeaderUpdate]);
+
+  // синхронизация настроек с движком (очередь генома имеет приоритет)
+  useEffect(() => {
+    const pending = engine.getPendingParams();
+    engine.updateCfg(pending ? { ...makeCfg(), params: pending } : makeCfg());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engine, pair, tf, deposit, riskPct, pollSec, mode, testnet, apiKey, apiSecret, source, bestParams, manual, strat, leaderGenome]);
+
+  // остановка движка (уход с вкладки / смена пары / размонтирование):
+  // live-сессия лидера фиксируется, очередь генома сбрасывается
   useEffect(() => {
     return () => {
       engine.stop();
+      deactivateLeader();
+      setPendingLeaderId(null);
+      engine.setPendingParams(null);
+      onEngineRunning(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engine]);
 
+  // смена пары/таймфрейма — перезапуск движка
   useEffect(() => {
-    engine.stop();
     setEngine(new TradingEngine(makeCfg()));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pair, tf]);
+
+  // ---------- деплой стратегии из Leaderboard ----------
+  const processedReq = useRef(0);
+  useEffect(() => {
+    if (!deployReq || deployReq.reqId === processedReq.current) return;
+    processedReq.current = deployReq.reqId;
+    const { genome, market, leverage, switchMarket, leaderId: lid } = deployReq;
+    if (switchMarket) onMarketSwitch(market, leverage);
+    setLeaderGenome(genome);
+    setLeaderId(lid);
+    setSource("leader");
+    const sn = engine.getSnapshot();
+    if (sn.running && sn.position) {
+      // открыта сделка — замена строго после её закрытия
+      engine.setPendingParams(genome);
+      setPendingLeaderId(lid);
+      onLeaderUpdate(lid, { queued: true });
+    } else {
+      engine.setPendingParams(null);
+      engine.updateCfg({ params: genome });
+      if (sn.running) {
+        deactivateLeader();
+        activateLeader(lid);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deployReq]);
+
+  // очередь: стратегия применилась после закрытия сделки
+  useEffect(() => {
+    if (!pendingLeaderId) return;
+    const sn = engine.getSnapshot();
+    if (!sn.position && engine.getPendingParams() === null) {
+      deactivateLeader();
+      activateLeader(pendingLeaderId);
+      setPendingLeaderId(null);
+    }
+  }, [snap, pendingLeaderId, activateLeader, deactivateLeader]);
 
   const onTest = async () => {
     setTesting(true);
@@ -339,13 +457,28 @@ export default function TradingTab({ pair, tf, onPair, onTf, strat, manual, best
                 <span className="block text-[12px] text-mut mb-1.5">Источник генома</span>
                 <Seg
                   options={[
-                    { v: "manual", label: "ФИКС. ГЕНОМ" },
+                    { v: "manual", label: "ФИКС." },
                     { v: "best", label: bestParams ? "ЛУЧШИЙ GA" : "GA (нет)" },
+                    { v: "leader", label: leaderGenome ? "ЛИДЕР" : "ЛИДЕР (нет)" },
                   ]}
                   value={source}
-                  onChange={(v) => setSource(v === "best" && !bestParams ? "manual" : v)}
+                  onChange={(v) => {
+                    if (v === "best" && !bestParams) return;
+                    if (v === "leader" && !leaderGenome) return;
+                    setSource(v);
+                    if (pendingLeaderId) {
+                      // ручная смена источника отменяет очередь лидера
+                      setPendingLeaderId(null);
+                      engine.setPendingParams(null);
+                    }
+                  }}
                   disabled={snap.running}
                 />
+                {pendingLeaderId ? (
+                  <p className="qe-num text-[10px] text-amber2 mt-1.5 leading-relaxed">
+                    Геном лидера в очереди: применится после закрытия открытой сделки.
+                  </p>
+                ) : null}
               </div>
               <div className="grid grid-cols-3 gap-2 qe-num text-[11px]">
                 <div className="bg-bg1/70 border border-line rounded-md px-2 py-1.5">
@@ -377,18 +510,39 @@ export default function TradingTab({ pair, tf, onPair, onTf, strat, manual, best
               <button
                 type="button"
                 className="btn-run w-full py-3 text-[13px] tracking-wide flex items-center justify-center gap-2"
-                onClick={() => engine.start()}
+                onClick={() => {
+                  engine.start();
+                  if (!engine.getSnapshot().running) return;
+                  onEngineRunning(true);
+                  deactivateLeader();
+                  if (source === "leader" && leaderId) activateLeader(leaderId);
+                }}
                 disabled={liveBlocked}
               >
                 <IconPlay />
                 {mode === "live" ? "ЗАПУСТИТЬ LIVE-ТОРГОВЛЮ" : "ЗАПУСТИТЬ ДВИЖОК"}
               </button>
             ) : (
-              <button type="button" className="btn-stop w-full py-3 text-[13px] qe-num font-bold flex items-center justify-center gap-2" onClick={() => engine.stop()}>
+              <button
+                type="button"
+                className="btn-stop w-full py-3 text-[13px] qe-num font-bold flex items-center justify-center gap-2"
+                onClick={() => {
+                  engine.stop();
+                  onEngineRunning(false);
+                  deactivateLeader();
+                  setPendingLeaderId(null);
+                  engine.setPendingParams(null);
+                }}
+              >
                 <IconStop />
                 ОСТАНОВИТЬ
               </button>
             )}
+            {source === "leader" && leaderId ? (
+              <p className="qe-num text-[10px] text-teal leading-relaxed">
+                Активен геном лидера из Leaderboard{pendingLeaderId ? " — замена в очереди" : ""}.
+              </p>
+            ) : null}
             {liveBlocked ? (
               <p className="qe-num text-[10px] text-red leading-relaxed">LIVE-режим требует API Key и Secret.</p>
             ) : null}

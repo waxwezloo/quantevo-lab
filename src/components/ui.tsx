@@ -91,6 +91,15 @@ export function IconTrade() {
     </svg>
   );
 }
+export function IconTrophy() {
+  return (
+    <svg {...S} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M5 2.5h6v3.6a3 3 0 0 1-6 0V2.5Z" />
+      <path d="M5 3.4H3a.8.8 0 0 0-.8.9c.1 1.5 1.1 2.6 2.8 2.9M11 3.4h2a.8.8 0 0 1 .8.9c-.1 1.5-1.1 2.6-2.8 2.9" />
+      <path d="M8 9.1v1.9M5.8 13.5h4.4M6.6 11h2.8v2.5H6.6z" />
+    </svg>
+  );
+}
 export function IconUpload() {
   return (
     <svg {...S} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

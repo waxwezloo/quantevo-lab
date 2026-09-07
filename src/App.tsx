@@ -6,9 +6,20 @@ import EquityChart from "./components/EquityChart";
 import FitnessChart from "./components/FitnessChart";
 import PopulationTable from "./components/PopulationTable";
 import CodePanel from "./components/CodePanel";
-import TradingTab from "./components/TradingTab";
-import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, IconTrade, IconDownload, fmtPct, fmtNum } from "./components/ui";
+import TradingTab, { type DeployReq } from "./components/TradingTab";
+import { Panel, Stat, Led, IconHelix, IconFlask, IconCode, IconTrade, IconTrophy, IconDownload, fmtPct, fmtNum } from "./components/ui";
+import LeaderboardTab from "./components/LeaderboardTab";
 import { loadKlines, TIMEFRAMES, daysForTf } from "./lib/data";
+import {
+  loadLeaders,
+  saveLeaders,
+  newLeaderId,
+  applyLeaderUpdate,
+  marketLabel,
+  tfLabel as tfLabelMin,
+  type Leader,
+  type LeaderUpdate,
+} from "./lib/leaders";
 import type { Candle } from "./lib/indicators";
 import { ema, rsiWilder } from "./lib/indicators";
 import type { StratCfg, BacktestResult, Params } from "./lib/backtest";
@@ -53,7 +64,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { err: Error | nu
 }
 
 export default function App() {
-  const [tab, setTab] = useState<"lab" | "trading" | "code">("lab");
+  const [tab, setTab] = useState<"lab" | "trading" | "leaderboard" | "code">("lab");
   const [pair, setPair] = useState("BTCUSDT");
   const [tf, setTf] = useState(60);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -75,17 +86,17 @@ export default function App() {
   const [manualResult, setManualResult] = useState<BacktestResult | null>(null);
   const [baseline, setBaseline] = useState<BacktestResult | null>(null);
 
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState<{ gen: number; total: number } | null>(null);
-  const [history, setHistory] = useState<GenInfo[]>([]);
-  const [popRows, setPopRows] = useState<PopRow[]>([]);
-  const [best, setBest] = useState<{ row: PopRow; result: BacktestResult } | null>(null);
-  const [previewIdx, setPreviewIdx] = useState(-1);
-  const [previewResult, setPreviewResult] = useState<BacktestResult | null>(null);
+  // ---------- Leaderboard ----------
+  const [leaders, setLeaders] = useState<Leader[]>(() => loadLeaders());
+  const [deployReq, setDeployReq] = useState<DeployReq | null>(null);
+  const [tradingRunning, setTradingRunning] = useState(false);
+  const [marketWarn, setMarketWarn] = useState<{ to: "spot" | "linear"; rest: Partial<StratCfg> } | null>(null);
+
+  useEffect(() => {
+    saveLeaders(leaders);
+  }, [leaders]);
 
   const [log, setLog] = useState<LogLine[]>([]);
-  const [reloadKey, setReloadKey] = useState(0);
-  const stopRef = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const pushLog = useCallback((msg: string, kind: LogLine["kind"] = "info") => {
@@ -98,6 +109,125 @@ export default function App() {
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [log]);
+
+  const handleLeaderUpdate = useCallback((id: string, upd: LeaderUpdate) => {
+    setLeaders((prev) => prev.map((l) => (l.id === id ? applyLeaderUpdate(l, upd) : l)));
+  }, []);
+
+  const addLeader = useCallback(
+    (row: PopRow, result: BacktestResult, meta: { pair: string; tf: number; market: "spot" | "linear"; leverage: number }) => {
+      const leader: Leader = {
+        id: newLeaderId(),
+        createdAt: Date.now(),
+        pair: meta.pair,
+        tf: meta.tf,
+        market: meta.market,
+        leverage: meta.leverage,
+        genome: decodeGenome(row.genome),
+        fitness: row.fit,
+        metrics: result.metrics,
+        liveMs: 0,
+        liveStartedAt: null,
+        liveProfit: 0,
+        liveTrades: 0,
+        active: false,
+        queued: false,
+      };
+      setLeaders((prev) => [leader, ...prev]);
+      pushLog(`Лидер эволюции сохранён в Leaderboard (фитнес ${row.fit.toFixed(2)})`, "ok");
+    },
+    [pushLog]
+  );
+
+  const handleDeployLeader = useCallback(
+    (l: Leader, switchMarket: boolean) => {
+      // режим рынка уже подтверждён в диалоге Leaderboard
+      if (switchMarket) {
+        setStrat((s) => ({
+          ...s,
+          mode: l.market,
+          leverage: l.market === "linear" ? l.leverage : s.leverage,
+          feePct: l.market === "spot" ? 0.1 : 0.055,
+        }));
+      }
+      setDeployReq({
+        reqId: Date.now(),
+        leaderId: l.id,
+        genome: l.genome,
+        market: l.market,
+        leverage: l.leverage,
+        switchMarket,
+      });
+      setTab("trading");
+      pushLog(
+        `Стратегия лидера ${l.pair.replace("USDT", "")}/${tfLabelMin(l.tf)} отправлена в торговый терминал${switchMarket ? ` · режим: ${marketLabel(l.market)}` : ""}`,
+        "ok"
+      );
+    },
+    [pushLog]
+  );
+
+  const handleDeleteLeaders = useCallback(
+    (ids: string[]) => {
+      const set = new Set(ids);
+      setLeaders((prev) => prev.filter((l) => !set.has(l.id)));
+      pushLog(`Удалено лидеров: ${ids.length}`, "warn");
+    },
+    [pushLog]
+  );
+
+  const handleImportLeaders = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const j = JSON.parse(String(reader.result)) as { leaders?: Leader[] };
+          if (!Array.isArray(j.leaders)) throw new Error("no leaders");
+          const valid = j.leaders.filter((l) => l && l.id && l.genome && l.metrics);
+          if (valid.length === 0) throw new Error("empty");
+          const norm = valid.map((l) => ({ ...l, active: false, liveStartedAt: null, queued: false }));
+          setLeaders(norm);
+          pushLog(`Импортировано лидеров: ${norm.length} из ${file.name}`, "ok");
+        } catch {
+          pushLog(`Импорт не удался: ${file.name} не похож на экспорт Leaderboard`, "warn");
+        }
+      };
+      reader.readAsText(file);
+    },
+    [pushLog]
+  );
+
+  const handleMarketSwitch = useCallback((market: "spot" | "linear", leverage: number) => {
+    setStrat((s) => ({
+      ...s,
+      mode: market,
+      leverage: market === "linear" ? leverage : s.leverage,
+      feePct: market === "spot" ? 0.1 : 0.055,
+    }));
+  }, []);
+
+  // смена спот ↔ фьючерсы из любых настроек — с предупреждением
+  const handleStratPatch = useCallback(
+    (patch: Partial<StratCfg>) => {
+      if (patch.mode && patch.mode !== strat.mode) {
+        setMarketWarn({ to: patch.mode, rest: patch });
+        return;
+      }
+      setStrat((s) => ({ ...s, ...patch }));
+    },
+    [strat.mode]
+  );
+
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<{ gen: number; total: number } | null>(null);
+  const [history, setHistory] = useState<GenInfo[]>([]);
+  const [popRows, setPopRows] = useState<PopRow[]>([]);
+  const [best, setBest] = useState<{ row: PopRow; result: BacktestResult } | null>(null);
+  const [previewIdx, setPreviewIdx] = useState(-1);
+  const [previewResult, setPreviewResult] = useState<BacktestResult | null>(null);
+
+  const [reloadKey, setReloadKey] = useState(0);
+  const stopRef = useRef(false);
 
   const tfLabel = TIMEFRAMES.find((t) => t.min === tf)?.label ?? "1Ч";
   const days = daysForTf(tf);
@@ -209,6 +339,12 @@ export default function App() {
     setProgress(null);
     if (outcome) {
       setBest({ row: outcome.best, result: outcome.result });
+      addLeader(outcome.best, outcome.result, {
+        pair,
+        tf,
+        market: strat.mode,
+        leverage: strat.mode === "linear" ? strat.leverage : 1,
+      });
       const m = outcome.result.metrics;
       const secs = ((performance.now() - t0) / 1000).toFixed(1);
       pushLog(
@@ -402,6 +538,7 @@ export default function App() {
             [
               { k: "lab", label: "Лаборатория", icon: <IconFlask /> },
               { k: "trading", label: "Торговля · Live", icon: <IconTrade /> },
+              { k: "leaderboard", label: "Leaderboard", icon: <IconTrophy /> },
               { k: "code", label: "Python-код", icon: <IconCode /> },
             ] as const
           ).map((t) => (
@@ -424,8 +561,9 @@ export default function App() {
         </nav>
 
         {/* ---------- content ---------- */}
-        {tab === "lab" ? (
-          <main key="lab" className="max-w-[1660px] mx-auto px-4 pb-6 reveal">
+        {/* вкладки остаются смонтированными (hidden), чтобы торговый движок не прерывался */}
+        <div className={tab === "lab" ? "" : "hidden"}>
+          <main className="max-w-[1660px] mx-auto px-4 pb-6 reveal">
             <div className="grid gap-3 grid-cols-1 lg:grid-cols-[290px_minmax(0,1fr)] xl:grid-cols-[290px_minmax(0,1fr)_308px] items-start">
               <div className="reveal" style={{ animationDelay: "40ms" }}>
                 <ControlPanel
@@ -438,7 +576,7 @@ export default function App() {
                   ga={ga}
                   onGa={(patch) => setGa((g) => ({ ...g, ...patch }))}
                   strat={strat}
-                  onStrat={(patch) => setStrat((s) => ({ ...s, ...patch }))}
+                  onStrat={handleStratPatch}
                   manual={manual}
                   onManual={(patch) => setManual((mm) => ({ ...mm, ...patch }) as Params)}
                   onRunManual={runManual}
@@ -586,23 +724,90 @@ export default function App() {
               </div>
             </div>
           </main>
-        ) : tab === "trading" ? (
-          <main key="trading" className="reveal">
-            <TradingTab
-              pair={pair}
-              tf={tf}
-              onPair={setPair}
-              onTf={setTf}
-              strat={strat}
-              manual={manual}
-              bestParams={bestParams}
-            />
-          </main>
-        ) : (
-          <main key="code" className="reveal">
+        </div>
+
+        <div className={tab === "trading" ? "reveal" : "hidden"}>
+          <TradingTab
+            pair={pair}
+            tf={tf}
+            onPair={setPair}
+            onTf={setTf}
+            strat={strat}
+            manual={manual}
+            bestParams={bestParams}
+            deployReq={deployReq}
+            onLeaderUpdate={handleLeaderUpdate}
+            onMarketSwitch={handleMarketSwitch}
+            onEngineRunning={setTradingRunning}
+          />
+        </div>
+
+        <div className={tab === "leaderboard" ? "" : "hidden"}>
+          <LeaderboardTab
+            leaders={leaders}
+            tradingMarket={strat.mode}
+            tradingRunning={tradingRunning}
+            onDelete={handleDeleteLeaders}
+            onDeploy={handleDeployLeader}
+            onImportLeaders={handleImportLeaders}
+          />
+        </div>
+
+        <div className={tab === "code" ? "" : "hidden"}>
+          <main className="reveal">
             <CodePanel />
           </main>
-        )}
+        </div>
+
+        {/* ---------- предупреждение: смена спот ↔ фьючерсы ---------- */}
+        {marketWarn ? (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-bg0/80 backdrop-blur-sm"
+            onClick={() => setMarketWarn(null)}
+          >
+            <div className="qe-panel w-full max-w-md p-5 reveal" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center gap-2 text-amber2 qe-num text-[11px] font-bold mb-2">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 3 2.5 20h19L12 3Z" />
+                  <path d="M12 10v4M12 17.5v.5" />
+                </svg>
+                СМЕНА РЕЖИМА РЫНКА
+              </div>
+              <p className="text-[12px] text-mut leading-relaxed mb-2">
+                Вы переключаете терминал с режима{" "}
+                <b className="text-ink">{marketLabel(strat.mode)}</b> на{" "}
+                <b className="text-amber2">{marketLabel(marketWarn.to)}</b>.
+              </p>
+              <p className="qe-num text-[10.5px] text-dim leading-relaxed mb-4 border border-line rounded-lg p-2.5 bg-bg1/60">
+                {marketWarn.to === "linear"
+                  ? `Фьючерсы (USDT Perpetual) используют кредитное плечо ×${strat.leverage}, фандинг каждые 8 часов и могут приводить к ликвидации позиции. Комиссия taker будет установлена 0.055%.`
+                  : "Спот торгует без плеча, фандинга и ликвидации. Комиссия taker будет установлена 0.1%."}
+              </p>
+              <div className="flex gap-2 justify-end">
+                <button type="button" className="btn-ghost px-4 py-2.5 text-[12px] qe-num font-semibold" onClick={() => setMarketWarn(null)}>
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  className="btn-run px-5 py-2.5 text-[12px] qe-num tracking-wide"
+                  onClick={() => {
+                    const { to, rest } = marketWarn;
+                    setStrat((s) => ({
+                      ...s,
+                      ...rest,
+                      mode: to,
+                      feePct: to === "spot" ? 0.1 : 0.055,
+                    }));
+                    setMarketWarn(null);
+                    pushLog(`Режим рынка переключён: ${marketLabel(to)}`, "warn");
+                  }}
+                >
+                  ПОДТВЕРДИТЬ ПЕРЕКЛЮЧЕНИЕ
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {/* ---------- footer ---------- */}
         <footer className="border-t border-line/70 bg-bg0/70">

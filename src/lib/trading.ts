@@ -214,6 +214,7 @@ export class TradingEngine {
   private lastBarT = 0;
   private listeners = new Set<() => void>();
   private livePosSynced = false;
+  private pendingParams: Params | null = null;
 
   constructor(cfg: TradingCfg) {
     this.cfg = cfg;
@@ -263,6 +264,33 @@ export class TradingEngine {
 
   get config(): TradingCfg {
     return this.cfg;
+  }
+
+  // ---------- очередь замены генома (Leaderboard) ----------
+  // Стратегия лидера заменяется только после закрытия открытой сделки.
+  setPendingParams(p: Params | null) {
+    this.pendingParams = p;
+    if (p) {
+      if (this.snap.position) {
+        this.log("warn", "Геном лидера в очереди: применится после закрытия открытой сделки");
+      } else {
+        this.applyPending();
+        return;
+      }
+    }
+    this.emit();
+  }
+
+  getPendingParams(): Params | null {
+    return this.pendingParams;
+  }
+
+  private applyPending() {
+    if (!this.pendingParams) return;
+    this.cfg = { ...this.cfg, params: this.pendingParams };
+    this.pendingParams = null;
+    this.log("ok", "Геном лидера применён: торговля продолжается с новой стратегией");
+    this.emit();
   }
 
   resetEquity() {
@@ -539,6 +567,8 @@ export class TradingEngine {
       );
       this.livePosSynced = false;
     }
+    // сделка закрыта — применяем стратегию лидера из очереди (если есть)
+    this.applyPending();
   }
 
   private liquidate(pos: PositionInfo, exitP: number, time: number) {
@@ -564,5 +594,6 @@ export class TradingEngine {
       void placeMarketOrder(this.cfg, pos.side === 1 ? "Sell" : "Buy", pos.qty, exitP, true).catch(() => undefined);
       this.livePosSynced = false;
     }
+    this.applyPending();
   }
 }

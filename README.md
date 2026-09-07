@@ -1,6 +1,6 @@
 # QuantEvo Lab — генетическая лаборатория алго-трейдинга Bybit
 
-[![Deploy to GitHub Pages](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/YOUR_USERNAME/quantevo-lab/actions/workflows/deploy.yml)
+[![Deploy to GitHub Pages](https://github.com/waxwezloo/quantevo-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/waxwezloo/quantevo-lab/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-f2b33d.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3bc9c4.svg)](python/)
 [![Bybit API V5](https://img.shields.io/badge/Bybit-API%20V5-6fa8ff.svg)](https://bybit-exchange.github.io/docs/v5/intro)
